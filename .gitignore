@@ -183,3 +183,4 @@ myenv/
 cyber_brain/
 threat_reports/
 *.json
+brain/
