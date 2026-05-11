@@ -4,6 +4,7 @@ import logging
 import google.generativeai as genai
 import google.api_core.exceptions
 from dotenv import load_dotenv
+from pathlib import Path
 
 # ── Logging ───────────────────────────────────────────────────────────────────
 logging.basicConfig(
@@ -13,14 +14,14 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 # ── Environment ───────────────────────────────────────────────────────────────
-load_dotenv()
+load_dotenv(dotenv_path=Path(__file__).parent / ".env", override=True)
 
 # ── Constants ─────────────────────────────────────────────────────────────────
 MAX_QUERY_LENGTH  = 2000   # ~500 tokens — prevents context window abuse
 MAX_CONTEXT_CHARS = 12000  # hard ceiling on total ingested chunk size per call
 
 # Model name as env variable — changing models in production = update .env, not code
-MODEL_NAME = os.getenv("GEMINI_MODEL_NAME", "gemini-1.5-flash")
+MODEL_NAME = os.getenv("GEMINI_MODEL_NAME", "gemini-2.5-flash")
 
 SYSTEM_INSTRUCTION = (
     "You are a Senior SOC Analyst Assistant. "
