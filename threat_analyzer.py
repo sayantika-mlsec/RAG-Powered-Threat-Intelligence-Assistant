@@ -3,13 +3,14 @@ import html
 import logging
 import google.generativeai as genai
 import google.api_core.exceptions
+from dataclasses import dataclass, field
 from dotenv import load_dotenv
 from pathlib import Path
 
 # ── Logging ───────────────────────────────────────────────────────────────────
 logging.basicConfig(
     level=logging.INFO,
-    format='%(asctime)s - %(levelname)s - %(name)s - %(message)s'
+    format="%(asctime)s - %(levelname)s - %(name)s - %(message)s"
 )
 logger = logging.getLogger(__name__)
 
@@ -17,8 +18,9 @@ logger = logging.getLogger(__name__)
 load_dotenv(dotenv_path=Path(__file__).parent / ".env", override=True)
 
 # ── Constants ─────────────────────────────────────────────────────────────────
-MAX_QUERY_LENGTH  = 2000   # ~500 tokens — prevents context window abuse
-MAX_CONTEXT_CHARS = 12000  # hard ceiling on total ingested chunk size per call
+MAX_QUERY_LENGTH = 2000    # ~500 tokens — prevents context window abuse
+MAX_CHUNK_CHARS  = 4000    # per-chunk ceiling — see _truncate_chunks() below
+MAX_CHUNKS       = 3       # max chunks passed to LLM regardless of n_results
 
 # Model name as env variable — changing models in production = update .env, not code
 MODEL_NAME = os.getenv("GEMINI_MODEL_NAME", "gemini-2.5-flash")
@@ -38,49 +40,121 @@ GENERATION_CONFIG = genai.types.GenerationConfig(
     # have no effect and setting them misleads future maintainers.
     #
     # NOTE: temperature=0.0 produces near-deterministic output but is NOT
-    # guaranteed deterministic due to floating point ops across GPU cores.
+    # guaranteed deterministic due to floating-point ops across GPU cores.
     max_output_tokens=2048,
     candidate_count=1
 )
 
 
+# ── Return Contract ───────────────────────────────────────────────────────────
+
+@dataclass
+class AnalysisResult:
+    """
+    FIX 2: Replaces bare str return from generate_answer().
+
+    Callers (Gradio, tests, CLI) check `success` to branch UI state:
+      - success=True  → render answer + source_citations
+      - success=False → render error state (red border, warning icon, etc.)
+
+    source_citations carries the metadatas from ChromaDB so the UI can
+    display which ATT&CK techniques contributed to the answer — a hard
+    roadmap requirement that a bare string return made impossible.
+    """
+    answer:           str
+    success:          bool
+    source_citations: list[dict] = field(default_factory=list)
+    error:            str | None = None
+
+    @classmethod
+    def ok(cls, answer: str, citations: list[dict]) -> "AnalysisResult":
+        """Factory for successful generation."""
+        return cls(answer=answer, success=True, source_citations=citations)
+
+    @classmethod
+    def fail(cls, error: str) -> "AnalysisResult":
+        """Factory for any failure path — validation, upstream, or LLM."""
+        return cls(answer="", success=False, source_citations=[], error=error)
+
+
 # ── Module-level prompt utilities ─────────────────────────────────────────────
-# These are module-level helpers, NOT defined inside generate_answer().
-# Reason: defining functions inside another function redefines them on every
-# call, makes them untestable, and signals confused code organisation.
+# Defined at module level, NOT inside generate_answer():
+# - redefining functions on every call wastes memory
+# - module-level functions are independently testable
+# - signals correct understanding of Python scoping
 
 def _sanitize_for_prompt(text: str) -> str:
     """
     Escapes XML/HTML special characters to neutralize prompt injection.
-    Converts <, >, & into &lt;, &gt;, &amp; so injected tags are treated
+    Converts <, >, &, ", ' into HTML entities so injected tags are treated
     as plain text content, not prompt structure.
 
-    Critical for a cybersecurity RAG system where ingested content
-    (malware reports, phishing samples, threat actor TTPs) is adversarial
-    by definition.
+    Also strips null bytes (\x00) which can cause silent truncation in some
+    LLM API implementations.
+
+    NOTE: This is a first-pass sanitizer covering the most common injection
+    vectors for XML-tagged prompts. It does not cover all possible injection
+    patterns (e.g., unicode direction overrides). For a production deployment
+    processing fully untrusted adversarial content, a dedicated prompt
+    injection library should be evaluated.
+
+    Critical for a cybersecurity RAG where ingested content (malware reports,
+    phishing samples, threat actor TTPs) is adversarial by definition.
     """
+    # Strip null bytes first — html.escape does not handle these
+    text = text.replace("\x00", "")
+    # quote=True also escapes " and ' — important if chunks are ever
+    # interpolated into attribute positions in future prompt formats
     return html.escape(text, quote=True)
 
 
-def _build_prompt(query: str, context_chunks: list) -> str:
+def _truncate_chunks(
+    chunks: list[str],
+    metadatas: list[dict]
+) -> tuple[list[str], list[dict]]:
     """
-    Constructs the sanitized RAG prompt with hard length limits.
+    FIX 3 (truncation): Enforces per-chunk and total-chunk limits BEFORE
+    building the prompt string.
+
+    Why chunk-level instead of string-level truncation:
+      - String-level truncation (old approach) cuts mid-chunk silently.
+        Metadatas still claim N sources contributed, but source N may have
+        been entirely discarded. UI would cite a source that contributed
+        zero content — a correctness lie.
+      - Chunk-level truncation keeps metadatas and chunks in sync:
+        every cited source actually contributed text to the answer.
+
+    Returns (truncated_chunks, matching_metadatas) — always the same length.
+    """
+    result_chunks: list[str]  = []
+    result_metas:  list[dict] = []
+
+    for chunk, meta in zip(chunks[:MAX_CHUNKS], metadatas[:MAX_CHUNKS]):
+        if len(chunk) > MAX_CHUNK_CHARS:
+            chunk = chunk[:MAX_CHUNK_CHARS]
+            logger.warning(
+                f"Chunk from '{meta.get('source', 'unknown')}' truncated to "
+                f"{MAX_CHUNK_CHARS} chars."
+            )
+        result_chunks.append(chunk)
+        result_metas.append(meta)
+
+    return result_chunks, result_metas
+
+
+def _build_prompt(query: str, context_chunks: list[str]) -> str:
+    """
+    Constructs the sanitized RAG prompt.
     Both query and all chunks are sanitized before interpolation.
-    Truncation warning is logged when context exceeds MAX_CONTEXT_CHARS.
+    Truncation is handled upstream in _truncate_chunks() — this function
+    receives already-bounded input and does not truncate.
     """
     safe_query  = _sanitize_for_prompt(query.strip())
     safe_chunks = [_sanitize_for_prompt(chunk) for chunk in context_chunks]
 
-    # Join chunks with a visible separator so the model treats them as
-    # distinct intelligence reports, not one continuous document.
+    # Visible separator so the model treats chunks as distinct intelligence
+    # reports, not one continuous document.
     context_text = "\n\n---\n\n".join(safe_chunks)
-
-    if len(context_text) > MAX_CONTEXT_CHARS:
-        context_text = context_text[:MAX_CONTEXT_CHARS]
-        logger.warning(
-            f"Context truncated to {MAX_CONTEXT_CHARS} chars "
-            f"to stay within token budget."
-        )
 
     return (
         "<threat_intelligence>\n"
@@ -99,13 +173,12 @@ def _safe_extract_text(response) -> tuple[str | None, str | None]:
 
     Accessing response.text directly raises ValueError when Gemini's
     safety filter blocks a response. This function checks all failure
-    modes explicitly before touching .text, and distinguishes:
-      - prompt-level blocks  (input was rejected)
-      - candidate-level safety filters
-      - unexpected finish reasons
-      - genuine successful responses
+    modes explicitly before touching .text, distinguishing:
+      - Prompt-level blocks  (input was rejected)
+      - Candidate-level safety filters
+      - Unexpected finish reasons
+      - Genuine successful responses
     """
-    # Check prompt-level block first (input itself was rejected)
     if response.prompt_feedback.block_reason:
         return None, f"PROMPT_BLOCKED:{response.prompt_feedback.block_reason.name}"
 
@@ -123,16 +196,16 @@ def _safe_extract_text(response) -> tuple[str | None, str | None]:
     return response.text, None
 
 
-# ── ThreatAnalyzer class ──────────────────────────────────────────────────────
+# ── ThreatAnalyzer ────────────────────────────────────────────────────────────
 
 class ThreatAnalyzer:
     """
     LLM generation layer for the RAG-powered Threat Intelligence Assistant.
 
-    Wrapping in a class (vs module-level initialization) means:
-    - ThreatAnalyzer() is instantiated explicitly — testable and mockable
-    - self.model can be swapped in tests without patching at module level
-    - Model name and config changes are isolated to __init__
+    Class design (vs module-level initialization):
+      - Instantiated explicitly — testable and mockable
+      - self.model can be swapped in tests without module-level patching
+      - Model name and config changes are isolated to __init__
     """
 
     def __init__(self):
@@ -172,36 +245,44 @@ class ThreatAnalyzer:
                 f"Query exceeds {MAX_QUERY_LENGTH} chars ({len(query)}). Truncating."
             )
             query = query[:MAX_QUERY_LENGTH]
-            # Truncation, not rejection — a 2001-char query is probably
-            # valid. Hard rejection creates unnecessary friction for
-            # legitimate SOC analysts under pressure.
+            # Truncation, not rejection — a 2001-char query is probably valid.
+            # Hard rejection creates unnecessary friction for SOC analysts
+            # working under time pressure.
 
         return query, None
 
     def _validate_search_results(
         self, search_results: dict | None
-    ) -> tuple[list | None, str | None]:
+    ) -> tuple[tuple[list, list] | None, str | None]:
         """
-        Validates the search_results structure returned by semantic_search().
-        Returns (context_chunks, error_message) — exactly one will be None.
+        FIX 1 + FIX 3: Validates the search_results dict from semantic_search()
+        and returns BOTH documents and metadatas so citations reach the caller.
 
-        Three distinct failure modes are distinguished:
-          1. None  — upstream semantic_search() failed entirely
-          2. Empty — search succeeded but found no relevant chunks
-          3. Malformed — unexpected structure from ChromaDB API change
+        Returns ((chunks, metadatas), error_message) — exactly one will be None.
+
+        Four failure modes distinguished:
+          1. None         — caller passed None (contract violation)
+          2. error key    — upstream semantic_search() failed (new contract)
+          3. Malformed    — unexpected ChromaDB structure
+          4. Empty result — search succeeded, no relevant chunks found
         """
-        # Guard 1: None check — semantic_search() returns None on exception
+        # Guard 1: None — caller violated the dict contract
         if search_results is None:
-            logger.warning(
-                "generate_answer received None search_results. "
-                "Upstream semantic_search() likely failed."
-            )
+            logger.warning("generate_answer received None — caller violated contract.")
             return None, "Threat intelligence search failed. Cannot generate analysis."
 
-        # Guard 2: Safe structural extraction
+        # FIX 1: Guard 2 — consume the "error" key from the new ingest.py contract
+        # The old code ignored this key entirely, causing wrong error messages in the UI.
+        upstream_error = search_results.get("error")
+        if upstream_error:
+            logger.warning(f"Upstream search error propagated: '{upstream_error}'")
+            return None, f"Threat intelligence search failed: {upstream_error}"
+
+        # Guard 3: Safe structural extraction
         try:
-            documents     = search_results.get('documents', [])
-            context_chunks = documents[0] if documents else []
+            context_chunks = search_results.get("documents", [[]])[0]
+            # FIX 3: extract metadatas in sync with chunks — never discard them
+            metadatas      = search_results.get("metadatas", [[]])[0]
         except (IndexError, TypeError, AttributeError) as e:
             logger.error(
                 f"Malformed search_results structure: {e}. "
@@ -209,103 +290,127 @@ class ThreatAnalyzer:
             )
             return None, "Threat intelligence search returned malformed data."
 
-        # Guard 3: Empty context — triage gate, do NOT call the LLM
+        # Guard 4: Empty result set — do NOT call the LLM with no context
         if not context_chunks:
             logger.warning("RAG BYPASS: No relevant chunks found. Aborting LLM call.")
-            return None, "No relevant threat intel found in the database. I cannot answer this query."
+            return None, "No relevant threat intel found for this query."
 
-        return context_chunks, None
+        return (context_chunks, metadatas), None
 
     # ── Core generation ───────────────────────────────────────────────────────
 
-    def _call_llm(self, prompt: str, query: str) -> str:
+    def _call_llm(self, prompt: str, query: str) -> tuple[str | None, str | None]:
         """
-        Calls the Gemini API with explicit handling for every failure mode:
-          - Safety blocks (security signal — log at WARNING)
-          - Quota exhaustion (operational signal — log at ERROR)
-          - Malformed requests (developer signal — log at ERROR)
-          - Unexpected errors (catch-all with full stack trace)
+        Calls the Gemini API with explicit handling for every failure mode.
+        Returns (answer_text, error_reason) — exactly one will be None.
+
+        Failure taxonomy:
+          - Safety blocks     → security signal, log at WARNING, return user-safe message
+          - Quota exhaustion  → operational signal, log at ERROR
+          - Malformed request → developer signal, log at ERROR
+          - Unexpected errors → catch-all with full stack trace (exc_info=True)
         """
         try:
             response = self.model.generate_content(prompt)
             text, error_reason = _safe_extract_text(response)
 
             if error_reason:
-                # Safety blocks are a security signal in a cybersecurity RAG:
-                # they may indicate adversarial content in ingested documents.
+                # Safety blocks in a cybersecurity RAG may indicate adversarial
+                # content in ingested documents — flag for SOC supervisor review.
                 if "BLOCKED" in error_reason or "SAFETY" in error_reason:
                     logger.warning(
                         f"Generation safety-blocked for query '{query[:80]}': "
                         f"{error_reason}. Review ingested content for adversarial material."
                     )
                     return (
+                        None,
                         "This query triggered a content safety filter. "
                         "SOC supervisor review recommended."
                     )
                 logger.error(f"Generation failed with reason: {error_reason}")
-                return "An error occurred during threat analysis."
+                return None, "An error occurred during threat analysis."
 
-            logger.info(
-                f"Generation successful. Response length: {len(text)} chars."
-            )
-            return text
+            logger.info(f"Generation successful. Response length: {len(text)} chars.")
+            return text, None
 
         except google.api_core.exceptions.ResourceExhausted:
-            logger.error(
-                "Gemini API quota exhausted. Implement exponential backoff."
-            )
-            return "Service temporarily unavailable — API quota reached."
+            logger.error("Gemini API quota exhausted. Implement exponential backoff.")
+            return None, "Service temporarily unavailable — API quota reached."
 
         except google.api_core.exceptions.InvalidArgument as e:
             logger.error(f"Malformed request to Gemini API: {e}")
-            return "An error occurred during threat analysis."
+            return None, "An error occurred during threat analysis."
 
         except Exception as e:
-            # exc_info=True attaches the full stack trace to the log entry.
-            # In production, stack traces in logs save hours of debugging.
+            # exc_info=True attaches the full stack trace — saves hours of debugging.
             logger.error(
                 f"Unexpected LLM generation error for query '{query[:80]}': {e}",
                 exc_info=True
             )
-            return "An error occurred during threat analysis."
+            return None, "An error occurred during threat analysis."
 
     # ── Public interface ──────────────────────────────────────────────────────
 
-    def generate_answer(self, query: str | None, search_results: dict | None) -> str:
+    def generate_answer(
+        self,
+        query: str | None,
+        search_results: dict | None
+    ) -> AnalysisResult:
         """
         Entry point for the generation pipeline.
 
-        Pipeline order:
-          1. Validate query  (input contract)
-          2. Validate search_results  (upstream contract)
-          3. Build sanitized prompt  (security layer)
-          4. Call LLM  (generation layer)
+        FIX 2: Returns AnalysisResult dataclass instead of bare str.
+        Callers check result.success to branch UI state and use
+        result.source_citations to render ATT&CK technique citations.
 
-        Each stage fails fast with a specific, logged message.
-        No stage swallows errors silently.
+        Pipeline stages (fail-fast at each):
+          1. Validate query          — input contract
+          2. Validate search_results — upstream contract + extract metadatas
+          3. Truncate chunks         — chunk-level bounds (keeps metadata in sync)
+          4. Build sanitized prompt  — security layer
+          5. Call LLM                — generation layer
         """
         # Stage 1 — query validation
         query, query_error = self._validate_query(query)
         if query_error:
-            return query_error
+            return AnalysisResult.fail(query_error)
 
         logger.info(
             f"Incoming query ({len(query)} chars): "
             f"'{query[:80]}{'...' if len(query) > 80 else ''}'"
         )
 
-        # Stage 2 — search results validation
-        context_chunks, results_error = self._validate_search_results(search_results)
+        # Stage 2 — search results validation + metadata extraction
+        payload, results_error = self._validate_search_results(search_results)
         if results_error:
-            return results_error
+            return AnalysisResult.fail(results_error)
+
+        context_chunks, metadatas = payload
 
         logger.info(
-            f"RAG SUCCESS: {len(context_chunks)} chunks retrieved. "
+            f"RAG SUCCESS: {len(context_chunks)} chunk(s) retrieved. "
             f"Initiating deterministic generation."
         )
 
-        # Stage 3 — sanitized prompt construction
+        # Stage 3 — chunk-level truncation (keeps chunks + metadatas in sync)
+        context_chunks, metadatas = _truncate_chunks(context_chunks, metadatas)
+
+        # Stage 4 — sanitized prompt construction
         prompt = _build_prompt(query, context_chunks)
 
-        # Stage 4 — LLM call with explicit failure handling
-        return self._call_llm(prompt, query)
+        # Stage 5 — LLM call
+        answer, llm_error = self._call_llm(prompt, query)
+        if llm_error:
+            return AnalysisResult.fail(llm_error)
+
+        # Deduplicate citations by technique_id — multiple chunks from the
+        # same technique should appear as one citation in the UI, not N.
+        seen: set[str] = set()
+        unique_citations: list[dict] = []
+        for meta in metadatas:
+            tid = meta.get("technique_id", meta.get("source", "unknown"))
+            if tid not in seen:
+                seen.add(tid)
+                unique_citations.append(meta)
+
+        return AnalysisResult.ok(answer=answer, citations=unique_citations)
