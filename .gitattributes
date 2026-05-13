@@ -1,2 +1,4 @@
 # Auto detect text files and perform LF normalization
 * text=auto
+brain/** filter=lfs diff=lfs merge=lfs -text
+threat_reports/** filter=lfs diff=lfs merge=lfs -text
