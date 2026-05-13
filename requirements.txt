@@ -1,0 +1,6 @@
+gradio>=4.0
+chromadb
+google-generativeai
+langchain-text-splitters
+sentence-transformers
+python-dotenv

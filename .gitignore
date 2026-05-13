@@ -185,3 +185,5 @@ threat_reports/
 *.json
 brain/
 .env
+*.pyc
+message.txt

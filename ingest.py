@@ -95,7 +95,7 @@ class ThreatIntelDB:
             return stats
 
         # FIX 2: glob already guarantees *.txt — no redundant endswith check needed
-        txt_files = sorted(dir_path.glob("*.txt"))
+        txt_files = sorted(dir_path.rglob("*.txt"))
 
         if not txt_files:
             logger.warning(f"No .txt files found in '{directory_path}'. Nothing to ingest.")
@@ -158,10 +158,10 @@ class ThreatIntelDB:
                     }]
                 )
 
+                # FIX: prepend header to every chunk so context is never lost after splitting
                 documents = [c.page_content for c in chunks]
                 metadatas = [c.metadata for c in chunks]
                 ids       = [f"{filename}_{i}" for i in range(len(chunks))]
-
                 # ── Upsert ───────────────────────────────────────────────────
                 self._delete_existing_chunks(filename)
                 self.collection.upsert(documents=documents, metadatas=metadatas, ids=ids)

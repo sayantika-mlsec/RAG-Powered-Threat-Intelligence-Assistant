@@ -28,7 +28,10 @@ MODEL_NAME = os.getenv("GEMINI_MODEL_NAME", "gemini-2.5-flash")
 SYSTEM_INSTRUCTION = (
     "You are a Senior SOC Analyst Assistant. "
     "Answer ONLY using the threat intelligence provided in the <threat_intelligence> tags. "
-    "If the answer cannot be found in that context, respond exactly with: "
+    "The context may contain multiple partial excerpts from threat reports — "
+    "synthesize across all of them to form your answer. "
+    "If the answer genuinely cannot be found in any part of the provided context, "
+    "respond exactly with: "
     "'I do not have sufficient information in the provided threat intelligence.' "
     "Do not speculate. Do not use prior knowledge. Do not invent IOCs, techniques, or sources."
 )
@@ -85,26 +88,13 @@ class AnalysisResult:
 
 def _sanitize_for_prompt(text: str) -> str:
     """
-    Escapes XML/HTML special characters to neutralize prompt injection.
-    Converts <, >, &, ", ' into HTML entities so injected tags are treated
-    as plain text content, not prompt structure.
-
-    Also strips null bytes (\x00) which can cause silent truncation in some
-    LLM API implementations.
-
-    NOTE: This is a first-pass sanitizer covering the most common injection
-    vectors for XML-tagged prompts. It does not cover all possible injection
-    patterns (e.g., unicode direction overrides). For a production deployment
-    processing fully untrusted adversarial content, a dedicated prompt
-    injection library should be evaluated.
-
-    Critical for a cybersecurity RAG where ingested content (malware reports,
-    phishing samples, threat actor TTPs) is adversarial by definition.
+    Sanitizes USER INPUT only — not internal context chunks.
+    Applied exclusively to the query string in _build_prompt().
+    MITRE/CISA chunks are trusted internal data and must not be
+    escaped — doing so garbles markdown, URLs, and ATT&CK
+    cross-references that the LLM needs to read correctly.
     """
-    # Strip null bytes first — html.escape does not handle these
     text = text.replace("\x00", "")
-    # quote=True also escapes " and ' — important if chunks are ever
-    # interpolated into attribute positions in future prompt formats
     return html.escape(text, quote=True)
 
 
@@ -144,17 +134,15 @@ def _truncate_chunks(
 
 def _build_prompt(query: str, context_chunks: list[str]) -> str:
     """
-    Constructs the sanitized RAG prompt.
-    Both query and all chunks are sanitized before interpolation.
-    Truncation is handled upstream in _truncate_chunks() — this function
-    receives already-bounded input and does not truncate.
+    Only the user query is sanitized — it's the untrusted input.
+    Context chunks come from your own ingested MITRE/CISA data —
+    sanitizing them garbles markdown, URLs, and special characters
+    that the LLM needs to read correctly.
     """
-    safe_query  = _sanitize_for_prompt(query.strip())
-    safe_chunks = [_sanitize_for_prompt(chunk) for chunk in context_chunks]
+    safe_query = _sanitize_for_prompt(query.strip())
 
-    # Visible separator so the model treats chunks as distinct intelligence
-    # reports, not one continuous document.
-    context_text = "\n\n---\n\n".join(safe_chunks)
+    # Chunks are NOT sanitized — they are trusted internal data
+    context_text = "\n\n---\n\n".join(chunk for chunk in context_chunks)
 
     return (
         "<threat_intelligence>\n"
