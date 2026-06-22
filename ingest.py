@@ -7,6 +7,8 @@ from chromadb.config import Settings
 from langchain_text_splitters import RecursiveCharacterTextSplitter
 from chromadb.utils.embedding_functions import SentenceTransformerEmbeddingFunction
 
+import config
+
 # ─── Production Logging ───────────────────────────────────────────────────────
 logging.basicConfig(
     level=logging.INFO,
@@ -37,24 +39,27 @@ def _extract_field(text: str, field_name: str) -> str | None:
 # ─── ThreatIntelDB ────────────────────────────────────────────────────────────
 
 class ThreatIntelDB:
-    def __init__(self, db_path: str = "./brain"):
-        """Initializes the persistent vector database."""
+    def __init__(self):
+        """Initializes the database pulling strictly from config.py"""
         try:
-            self.client = chromadb.PersistentClient(path=db_path)
+            self.client = chromadb.PersistentClient(path=str(config.DB_PATH))
+            
             embedding_fn = SentenceTransformerEmbeddingFunction(
-                model_name="all-MiniLM-L6-v2"
+                model_name=config.EMBEDDING_MODEL
             )
+            
             self.collection = self.client.get_or_create_collection(
                 name="mitre_threat_intel",
                 embedding_function=embedding_fn,
                 metadata={"hnsw:space": "cosine"}
             )
+            
             self.splitter = RecursiveCharacterTextSplitter(
-                chunk_size=1000,
-                chunk_overlap=200,
+                chunk_size=config.CHUNK_SIZE,
+                chunk_overlap=config.CHUNK_OVERLAP,
                 separators=["\n\n", "\n", " ", ""]
             )
-            logger.info(f"Successfully connected to ChromaDB at '{db_path}'")
+            logger.info(f"Connected to ChromaDB. Model: {config.EMBEDDING_MODEL}")
         except Exception as e:
             logger.error(f"Failed to initialize ChromaDB: {e}")
             raise

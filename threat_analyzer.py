@@ -7,6 +7,9 @@ from dataclasses import dataclass, field
 from dotenv import load_dotenv
 from pathlib import Path
 
+
+import config
+
 # ── Logging ───────────────────────────────────────────────────────────────────
 logging.basicConfig(
     level=logging.INFO,
@@ -17,10 +20,6 @@ logger = logging.getLogger(__name__)
 # ── Environment ───────────────────────────────────────────────────────────────
 load_dotenv(dotenv_path=Path(__file__).parent / ".env", override=True)
 
-# ── Constants ─────────────────────────────────────────────────────────────────
-MAX_QUERY_LENGTH = 2000    # ~500 tokens — prevents context window abuse
-MAX_CHUNK_CHARS  = 4000    # per-chunk ceiling — see _truncate_chunks() below
-MAX_CHUNKS       = 3       # max chunks passed to LLM regardless of n_results
 
 # Model name as env variable — changing models in production = update .env, not code
 MODEL_NAME = os.getenv("GEMINI_MODEL_NAME", "gemini-2.5-flash")
@@ -115,22 +114,31 @@ def _truncate_chunks(
         every cited source actually contributed text to the answer.
 
     Returns (truncated_chunks, matching_metadatas) — always the same length.
+    
+    Truncates chunks dynamically by pulling limits directly from the global config.
     """
     result_chunks: list[str]  = []
     result_metas:  list[dict] = []
 
-    for chunk, meta in zip(chunks[:MAX_CHUNKS], metadatas[:MAX_CHUNKS]):
-        if len(chunk) > MAX_CHUNK_CHARS:
-            chunk = chunk[:MAX_CHUNK_CHARS]
+    # Pull limits directly from config
+    max_chunks = config.RETRIEVAL_TOP_K
+    max_chars  = config.MAX_CHUNK_CHARS
+
+    # Enforce the chunk count limit
+    for chunk, meta in zip(chunks[:max_chunks], metadatas[:max_chunks]):
+        
+        # Enforce the character limit per chunk
+        if len(chunk) > max_chars:
+            chunk = chunk[:max_chars]
             logger.warning(
                 f"Chunk from '{meta.get('source', 'unknown')}' truncated to "
-                f"{MAX_CHUNK_CHARS} chars."
+                f"{max_chars} chars."
             )
+            
         result_chunks.append(chunk)
         result_metas.append(meta)
 
     return result_chunks, result_metas
-
 
 def _build_prompt(query: str, context_chunks: list[str]) -> str:
     """
@@ -197,19 +205,17 @@ class ThreatAnalyzer:
     """
 
     def __init__(self):
+        """Initializes the analyzer pulling strictly from config.py"""
         api_key = os.getenv("GEMINI_API_KEY")
         if not api_key:
-            logger.error("CRITICAL: GEMINI_API_KEY environment variable is missing.")
             raise ValueError("GEMINI_API_KEY not found. Check your .env file.")
 
         genai.configure(api_key=api_key)
-
         self.model = genai.GenerativeModel(
             model_name=MODEL_NAME,
             system_instruction=SYSTEM_INSTRUCTION,
             generation_config=GENERATION_CONFIG
         )
-        logger.info(f"ThreatAnalyzer initialized with model: {MODEL_NAME}")
 
     # ── Input validation ──────────────────────────────────────────────────────
 
@@ -219,23 +225,15 @@ class ThreatAnalyzer:
         Returns (clean_query, error_message) — exactly one will be None.
         """
         if not query or not isinstance(query, str):
-            logger.warning("generate_answer called with empty or non-string query.")
-            return None, "Invalid query. Please provide a non-empty search string."
-
+            return None, "Invalid query."
+        
         query = query.strip()
-
         if len(query) < 3:
-            logger.warning(f"Query too short to be meaningful: '{query}'")
-            return None, "Query too short. Please provide more detail."
-
-        if len(query) > MAX_QUERY_LENGTH:
-            logger.warning(
-                f"Query exceeds {MAX_QUERY_LENGTH} chars ({len(query)}). Truncating."
-            )
-            query = query[:MAX_QUERY_LENGTH]
-            # Truncation, not rejection — a 2001-char query is probably valid.
-            # Hard rejection creates unnecessary friction for SOC analysts
-            # working under time pressure.
+            return None, "Query too short."
+        
+        # Pull directly from config
+        if len(query) > config.MAX_QUERY_LENGTH:
+            query = query[:config.MAX_QUERY_LENGTH]
 
         return query, None
 
