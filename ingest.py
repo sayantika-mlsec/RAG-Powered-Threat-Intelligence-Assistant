@@ -39,10 +39,10 @@ def _extract_field(text: str, field_name: str) -> str | None:
 # ─── ThreatIntelDB ────────────────────────────────────────────────────────────
 
 class ThreatIntelDB:
-    def __init__(self):
+    def __init__(self, db_path: str = str(config.DB_PATH)):
         """Initializes the database pulling strictly from config.py"""
         try:
-            self.client = chromadb.PersistentClient(path=str(config.DB_PATH))
+            self.client = chromadb.PersistentClient(path=db_path)
             
             embedding_fn = SentenceTransformerEmbeddingFunction(
                 model_name=config.EMBEDDING_MODEL
