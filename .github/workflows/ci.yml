@@ -1,0 +1,35 @@
+name: RAG Integration CI
+
+# Trigger the tests whenever code is pushed or a PR is opened against 'main'
+on:
+  push:
+    branches: [ "**" ]
+  pull_request:
+    branches: [ "main" ]
+
+jobs:
+  test-ml-pipeline:
+    runs-on: ubuntu-latest
+
+    steps:
+    - name: Checkout repository
+      uses: actions/checkout@v4
+
+    
+    - name: Set up Python
+      uses: actions/setup-python@v5
+      with:
+        python-version: '3.12' 
+        cache: 'pip'           
+
+    
+    - name: Install dependencies
+      run: |
+        python -m pip install --upgrade pip
+        pip install -r requirements.txt
+        
+    - name: Run Integration Tests
+      run: |
+        python -m pytest tests/test.py -v
+    
+    

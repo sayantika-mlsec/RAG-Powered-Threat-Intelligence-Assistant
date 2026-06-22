@@ -1,6 +1,7 @@
-gradio>=4.0
-chromadb
-google-generativeai
-langchain-text-splitters
-sentence-transformers
-python-dotenv
+gradio==6.14.0
+chromadb==1.5.9
+google-generativeai==0.8.6
+langchain-text-splitters==1.1.2
+sentence-transformers==5.4.1
+python-dotenv==1.2.2
+pytest==9.1.1
