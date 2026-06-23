@@ -26,11 +26,8 @@ def flatten_mitre(json_path: str):
     Field names match ingest.py's _extract_field() calls exactly:
       TECHNIQUE_ID, TACTIC, DATE_ADDED
 
-    TACTIC is extracted from kill_chain_phases[0].phase_name —
-    the field that was missing entirely from the old flatten script.
-    Multiple tactics are joined with " | " so one file can cover
-    techniques that span multiple phases (e.g. T1059 appears in
-    Execution and Defense Evasion).
+    TACTIC is extracted from kill_chain_phases[0].phase_name.
+    DATE_ADDED is extracted from the 'created' STIX property.
     """
     logger.info(f"Loading MITRE ATT&CK from: {json_path}")
 
@@ -55,6 +52,10 @@ def flatten_mitre(json_path: str):
         # ── Extract core fields ───────────────────────────────────────────────
         name = obj.get("name", "Unknown Technique")
         desc = obj.get("description", "No description provided.").strip()
+
+        # Date extraction: Slice ISO 8601 (YYYY-MM-DDTHH:MM:SS.SSSZ) to YYYY-MM-DD
+        created_raw = obj.get("created", "")
+        date_added = created_raw[:10] if created_raw else "unknown"
 
         # Technique ID from external_references
         ext_id = None
@@ -103,7 +104,7 @@ def flatten_mitre(json_path: str):
         with open(file_path, "w", encoding="utf-8") as out:
             out.write(f"TECHNIQUE_ID: {ext_id}\n")
             out.write(f"TACTIC: {tactic}\n")
-            out.write(f"DATE_ADDED: 2024-01-01\n\n")
+            out.write(f"DATE_ADDED: {date_added}\n\n")
             out.write(f"Technique Name: {name}\n")
             if platforms:
                 out.write(f"Platforms: {platforms}\n")
@@ -119,7 +120,6 @@ def flatten_mitre(json_path: str):
         f"skipped_subtechniques={count_skipped}, "
         f"skipped_no_id={count_no_id}"
     )
-
 
 # ── CISA KEV Flattener ────────────────────────────────────────────────────────
 
