@@ -1,0 +1,225 @@
+[{
+  "query": "What technique covers hiding command-and-control traffic by disguising it as legitimate protocols or padding it with junk data?",
+  "category": "mitre",
+  "difficulty": "medium",
+  "expected_technique_ids": ["T1001"],
+  "expected_cve_ids": [],
+  "expected_retrieval": true,
+  "expected_answer_summary": "T1001 (Data Obfuscation) covers hiding C2 communications to evade detection, including adding junk data to protocol traffic, using steganography, or impersonating legitimate protocols.",
+  "difficulty_note": "grounded in the T1001 parent chunk; replaces the original ungrounded 'what is steganography' query that spanned excluded sub-techniques"
+},
+
+{
+  "query": "How does an adversary hide a malicious payload on disk, then convert it back to runnable form right before executing it?",
+  "category": "mitre",
+  "difficulty": "hard",
+  "expected_technique_ids": ["T1027","T1140"],
+  "expected_cve_ids": [],
+  "expected_retrieval": true,
+  "expected_answer_summary": "The Sequence: T1027 (Obfuscated Files or Information) is used first to safely deliver and store the malicious payload on the system. T1140 (Deobfuscate/Decode) is used subsequently to reverse the obfuscation immediately before execution.",
+  "difficulty_note": "multi concepts based"
+},
+
+{
+  "query": "Which built-in Windows utilities do adversaries commonly abuse to decode or deobfuscate a payload before running it?",
+  "category": "mitre",
+  "difficulty": "medium",
+  "expected_technique_ids": ["T1140"],
+  "expected_cve_ids": [],
+  "expected_retrieval": true,
+  "expected_answer_summary": "certutil and powershell",
+  "difficulty_note": "specific question"
+},
+
+{
+  "query": "To prevent command history logging how attackers manipulate windows and macos/linux?",
+  "category": "mitre",
+  "difficulty": "hard",
+  "expected_technique_ids": ["T1690"],
+  "expected_cve_ids": [],
+  "expected_retrieval": true,
+  "expected_answer_summary": "On Linux/macOS, type a space before their commands (which tells the system not to log it), or delete the history file variable (unset HISTFILE). On Windows, change the settings in PowerShell so that it saves nothing or writes the log to a fake location.",
+  "difficulty_note": "version drift: T1690 in current ATT&CK vs T1562.003 in older bundles — confirm against ingested version"
+},
+
+{
+  "query": "How does an adversary defeat MFA, log in with legitimate credentials, then change account settings to keep persistent access?",
+  "category": "mitre",
+  "difficulty": "hard",
+  "expected_technique_ids": ["T1078","T1098","T1111"],
+  "expected_cve_ids": [],
+  "expected_retrieval": true,
+  "expected_answer_summary": "An adversary uses T1111 (Multi-Factor Authentication Interception) to intercept or bypass MFA, enabling T1078 (Valid Accounts) to authenticate with legitimate credentials. Once inside, they use T1098 (Account Manipulation) to modify account credentials or permission groups to preserve and potentially elevate access.",
+  "difficulty_note": "multi-concept chained query; T1098→T1078 relationship is drawn in the MITRE data itself"
+},
+
+
+{
+    "query": "What's the parent technique called when hackers inject their own code into the memory of a completely normal, running process to hide from security software?",
+    "category": "mitre",
+    "difficulty": "medium",
+    "expected_technique_ids": ["T1055"],
+    "expected_cve_ids": [],
+    "expected_retrieval": true,
+    "expected_answer_summary": "Adversaries inject code into processes to evade defenses and potentially elevate privileges by masking their execution under a legitimate process.",
+    "difficulty_note": "Conceptually overlaps with general evasion; requires the RAG to match the definition of running code in another process's memory space."
+},
+
+{
+    "query": "What technique is it when an attacker tricks the OS into loading malware by messing with folder search orders, environment variables, or path locations?",
+    "category": "mitre",
+    "difficulty": "hard",
+    "expected_technique_ids": ["T1574"],
+    "expected_cve_ids": [],
+    "expected_retrieval": true,
+    "expected_answer_summary": "Attackers manipulate OS execution paths (like DLL search orders or PATH variables) so that when a legitimate application requests a resource, the OS loads the attacker's payload instead.",
+    "difficulty_note": "This is a massive umbrella technique; the system must map 'directory search orders' and 'intercepting' to the parent technique rather than isolating a specific sub-technique like DLL side-loading."
+},
+
+{
+    "query": "What's it called when attackers steal data by sneaking it right out through the exact same server connection they're already using to control their malware?",
+    "category": "mitre",
+    "difficulty": "medium",
+    "expected_technique_ids": ["T1041"],
+    "expected_cve_ids": [],
+    "expected_retrieval": true,
+    "expected_answer_summary": "Adversaries exfiltrate data over the existing Command and Control (C2) channel to avoid creating new, suspicious outbound network connections.",
+    "difficulty_note": "Tests multi-hop conceptual matching, forcing the RAG to distinguish between the 'Exfiltration' tactic and the 'Command and Control' tactic."
+},
+
+{
+    "query": "What is the primary Microsoft Windows administration system, built on Web-Based Enterprise Management standards, that attackers commonly abuse to execute code and interact with local and remote systems?",
+    "category": "mitre",
+    "difficulty": "medium",
+    "expected_technique_ids": ["T1047"],
+    "expected_cve_ids": [],
+    "expected_retrieval": true,
+    "expected_answer_summary": "Windows Management Instrumentation is abused to execute commands, often via the wmic utility or through scripts interacting with its namespaces.",
+    "difficulty_note": "Tests entity extraction based on the underlying Microsoft technology description rather than the standard 'WMI' acronym."
+},
+
+{
+    "query": "Once initial access is achieved, what technique covers the act of bringing additional malware, scanning utilities, or secondary payloads from an external attacker-controlled server onto the compromised system?",
+    "category": "mitre",
+    "difficulty": "easy",
+    "expected_technique_ids": ["T1105"],
+    "expected_cve_ids": [],
+    "expected_retrieval": true,
+    "expected_answer_summary": "Adversaries use this technique to download or pull files into the compromised environment using native tools or custom protocols.",
+    "difficulty_note": "Tests basic definition matching without using keywords like 'download' or 'ingress'."
+},
+
+{
+  "query": "What is CVE-2012-4681 and why is it on CISA's known-exploited list?",
+  "category": "kev",
+  "difficulty": "easy",
+  "expected_technique_ids": [],
+  "expected_cve_ids": ["CVE-2012-4681"],
+  "expected_retrieval": true,
+  "expected_answer_summary": "A remote code execution vulnerability in the Oracle Java SE JRE component, listed in CISA KEV as actively exploited.",
+  "difficulty_note": "single-CVE lookup; tests CVE-ID to description retrieval"
+},
+
+{
+  "query": "What is CVE-2016-3715 and why is it on CISA's known-exploited list?",
+  "category": "kev",
+  "difficulty": "easy",
+  "expected_technique_ids": [],
+  "expected_cve_ids": ["CVE-2016-3715"],
+  "expected_retrieval": true,
+  "expected_answer_summary": "ImageMagick contains an unspecified vulnerability that could allow users to delete files by using ImageMagick's 'ephemeral' pseudo protocol, which deletes files after reading.",
+  "difficulty_note": "single-CVE lookup; tests CVE-ID to description retrieval"
+},
+
+{
+  "query": "Which Microsoft GDI flaw allowing privilege escalation is in the exploited catalog?",
+  "category": "kev",
+  "difficulty": "medium",
+  "expected_technique_ids": [],
+  "expected_cve_ids": ["CVE-2017-0001", "CVE-2017-0005"],
+  "expected_retrieval": true,
+  "expected_answer_summary": "Two GDI privilege-escalation flaws (CVE-2017-0001, CVE-2017-0005) where the Graphics Device Interface in Microsoft Windows allows local users to gain privileges via a crafted application.",
+  "difficulty_note": "narrow product + behavior; CVE-year not searchable in corpus so omitted from query"
+},
+
+{
+  "query": "Is there a known actively-exploited vulnerability in the Figma desktop application?",
+  "category": "kev",
+  "difficulty": "hard",
+  "expected_technique_ids": [],
+  "expected_cve_ids": [],
+  "expected_retrieval": true,
+  "expected_answer_summary": "No entry for Figma exists in the CISA KEV catalog; the system should report that nothing was found rather than fabricate a CVE.",
+  "difficulty_note": "restraint / negative case — product absent from KEV; tests whether the system invents a CVE or correctly reports no match"
+},
+
+{
+  "query": "Is the remote code execution flaw in Cisco IP Phones' web server listed as actively exploited, and what attack technique covers exploiting an internet-facing service like this?",
+  "category": "cross",
+  "difficulty": "hard",
+  "expected_technique_ids": ["T1190"],
+  "expected_cve_ids": ["CVE-2020-3161"],
+  "expected_retrieval": true,
+  "expected_answer_summary": "CVE-2020-3161, an HTTP input-validation flaw in Cisco IP Phones enabling remote code execution, is in CISA KEV as actively exploited; this maps thematically to T1190, Exploit Public-Facing Application.",
+  "difficulty_note": "cross-collection: KEV supplies the CVE, MITRE supplies the technique; single-pass retrieval to one collection returns a half-answer"
+},
+
+{
+  "query": "Is there an actively-exploited remote code execution flaw in Microsoft's SMB protocol, and what MITRE technique describes exploiting a remote service to move through a network?",
+  "category": "cross",
+  "difficulty": "hard",
+  "expected_technique_ids": ["T1210"],
+  "expected_cve_ids": ["CVE-2020-0796"],
+  "expected_retrieval": true,
+  "expected_answer_summary": "CVE-2020-0796 (SMBGhost) is an actively-exploited remote code execution flaw in SMBv3 allowing code execution on a target server or client; this maps to T1210, Exploitation of Remote Services, which covers exploiting a vulnerable service to gain access and move laterally within a network.",
+  "difficulty_note": "cross-collection: KEV supplies the SMBv3 RCE CVE, MITRE supplies T1210; tight fit because service-side RCE matches the technique's access-and-lateral-movement definition"
+},
+
+{
+  "query": "What's the capital of Italy?",
+  "category": "off-topic",
+  "difficulty": "easy",
+  "expected_technique_ids": [],
+  "expected_cve_ids": [],
+  "expected_retrieval": false,
+  "expected_answer_summary": "Off-topic query unrelated to threat intelligence; the system should not retrieve from either collection and should respond directly or decline.",
+  "difficulty_note": "off-topic — tests that routing skips retrieval entirely for non-security queries"
+},
+
+{
+  "query": "How old are you?",
+  "category": "off-topic",
+  "difficulty": "easy",
+  "expected_technique_ids": [],
+  "expected_cve_ids": [],
+  "expected_retrieval": false,
+  "expected_answer_summary": "Off-topic query unrelated to threat intelligence; the system should not retrieve from either collection and should respond directly or decline.",
+  "difficulty_note": "off-topic — tests that routing skips retrieval entirely for non-security queries"
+},
+
+{
+  "query": "What's scope of ML in Cybersecurity?",
+  "category": "off-topic",
+  "difficulty": "hard",
+  "expected_technique_ids": [],
+  "expected_cve_ids": [],
+  "expected_retrieval": false,
+  "expected_answer_summary": "Off-topic query unrelated to threat intelligence; the system should not retrieve from either collection and should respond directly or decline.",
+  "difficulty_note": "ML in cybersecurity might pull MITRE chunks on ML-related techniques and produce a confused half-retrieval. That ambiguity is the whole point of a hard routing case."
+},
+
+{
+  "query": "How to write an email?",
+  "category": "off-topic",
+  "difficulty": "easy",
+  "expected_technique_ids": [],
+  "expected_cve_ids": [],
+  "expected_retrieval": false,
+  "expected_answer_summary": "Off-topic query unrelated to threat intelligence; the system should not retrieve from either collection and should respond directly or decline.",
+  "difficulty_note": "off-topic — tests that routing skips retrieval entirely for non-security queries"
+}]
+
+
+
+
+ 

@@ -4,6 +4,7 @@ from pathlib import Path
 BASE_DIR = Path(__file__).parent
 INTEL_DIR = BASE_DIR / "threat_reports"
 DB_PATH = BASE_DIR / "brain"
+EVAL_SET_PATH = BASE_DIR / "eval_set.json"
 
 # ─── Vector Database & Chunking Limits ────────────────────────────────────────
 CHUNK_SIZE = 1000
