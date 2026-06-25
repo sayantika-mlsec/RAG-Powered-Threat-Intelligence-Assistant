@@ -189,3 +189,4 @@ brain/
 message.txt
 mlflow.db
 mlartifacts/
+!eval_set.json
