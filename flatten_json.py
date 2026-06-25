@@ -128,11 +128,11 @@ def flatten_cisa_kev(json_path: str):
     Reads known_exploited_vulnerabilities.json and writes one .txt per CVE.
 
     Field names match ingest.py's _extract_field() calls exactly:
-      VULNERABILITY_ID, TACTIC, DATE_ADDED
-
-    TACTIC is hardcoded to 'Exploitation' — CISA KEV entries are all
-    actively exploited vulnerabilities, so this is semantically correct
-    and gives the LLM useful tactic context.
+      VULNERABILITY_ID, DATE_ADDED
+    
+    Note: TACTIC is intentionally omitted here to prevent fabricated ground truth 
+    from corrupting RAG evaluation metrics. The downstream ingest.py script 
+    will safely catch this omission and default the metadata to 'unknown'.
     """
     logger.info(f"Loading CISA KEV from: {json_path}")
 
@@ -168,7 +168,7 @@ def flatten_cisa_kev(json_path: str):
         file_path = os.path.join(CISA_DIR, f"{cve_id}.txt")
         with open(file_path, "w", encoding="utf-8") as out:
             out.write(f"VULNERABILITY_ID: {cve_id}\n")
-            out.write(f"TACTIC: Exploitation\n")
+            # TACTIC line completely removed to enforce data integrity
             out.write(f"DATE_ADDED: {date_added}\n\n")
             out.write(f"Vulnerability Name: {vuln_name}\n")
             out.write(f"Vendor: {vendor}\n")
