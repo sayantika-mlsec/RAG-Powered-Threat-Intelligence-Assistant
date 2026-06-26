@@ -1,4 +1,5 @@
 [{
+  "id": "q001",
   "query": "What technique covers hiding command-and-control traffic by disguising it as legitimate protocols or padding it with junk data?",
   "category": "mitre",
   "difficulty": "medium",
@@ -10,6 +11,7 @@
 },
 
 {
+  "id": "q002",
   "query": "How does an adversary hide a malicious payload on disk, then convert it back to runnable form right before executing it?",
   "category": "mitre",
   "difficulty": "hard",
@@ -21,6 +23,7 @@
 },
 
 {
+  "id": "q003",
   "query": "Which built-in Windows utilities do adversaries commonly abuse to decode or deobfuscate a payload before running it?",
   "category": "mitre",
   "difficulty": "medium",
@@ -32,6 +35,7 @@
 },
 
 {
+  "id": "q004",
   "query": "To prevent command history logging how attackers manipulate windows and macos/linux?",
   "category": "mitre",
   "difficulty": "hard",
@@ -43,6 +47,7 @@
 },
 
 {
+  "id": "q005",
   "query": "How does an adversary defeat MFA, log in with legitimate credentials, then change account settings to keep persistent access?",
   "category": "mitre",
   "difficulty": "hard",
@@ -55,61 +60,67 @@
 
 
 {
-    "query": "What's the parent technique called when hackers inject their own code into the memory of a completely normal, running process to hide from security software?",
-    "category": "mitre",
-    "difficulty": "medium",
-    "expected_technique_ids": ["T1055"],
-    "expected_cve_ids": [],
-    "expected_retrieval": true,
-    "expected_answer_summary": "Adversaries inject code into processes to evade defenses and potentially elevate privileges by masking their execution under a legitimate process.",
-    "difficulty_note": "Conceptually overlaps with general evasion; requires the RAG to match the definition of running code in another process's memory space."
+  "id": "q006",
+  "query": "What's the parent technique called when hackers inject their own code into the memory of a completely normal, running process to hide from security software?",
+  "category": "mitre",
+  "difficulty": "medium",
+  "expected_technique_ids": ["T1055"],
+  "expected_cve_ids": [],
+  "expected_retrieval": true,
+  "expected_answer_summary": "Adversaries inject code into processes to evade defenses and potentially elevate privileges by masking their execution under a legitimate process.",
+  "difficulty_note": "Conceptually overlaps with general evasion; requires the RAG to match the definition of running code in another process's memory space."
 },
 
 {
-    "query": "What technique is it when an attacker tricks the OS into loading malware by messing with folder search orders, environment variables, or path locations?",
-    "category": "mitre",
-    "difficulty": "hard",
-    "expected_technique_ids": ["T1574"],
-    "expected_cve_ids": [],
-    "expected_retrieval": true,
-    "expected_answer_summary": "Attackers manipulate OS execution paths (like DLL search orders or PATH variables) so that when a legitimate application requests a resource, the OS loads the attacker's payload instead.",
-    "difficulty_note": "This is a massive umbrella technique; the system must map 'directory search orders' and 'intercepting' to the parent technique rather than isolating a specific sub-technique like DLL side-loading."
+  "id": "q007",
+  "query": "What technique is it when an attacker tricks the OS into loading malware by messing with folder search orders, environment variables, or path locations?",
+  "category": "mitre",
+  "difficulty": "hard",
+  "expected_technique_ids": ["T1574"],
+  "expected_cve_ids": [],
+  "expected_retrieval": true,
+  "expected_answer_summary": "Attackers manipulate OS execution paths (like DLL search orders or PATH variables) so that when a legitimate application requests a resource, the OS loads the attacker's payload instead.",
+  "difficulty_note": "This is a massive umbrella technique; the system must map 'directory search orders' and 'intercepting' to the parent technique rather than isolating a specific sub-technique like DLL side-loading."
 },
 
 {
-    "query": "What's it called when attackers steal data by sneaking it right out through the exact same server connection they're already using to control their malware?",
-    "category": "mitre",
-    "difficulty": "medium",
-    "expected_technique_ids": ["T1041"],
-    "expected_cve_ids": [],
-    "expected_retrieval": true,
-    "expected_answer_summary": "Adversaries exfiltrate data over the existing Command and Control (C2) channel to avoid creating new, suspicious outbound network connections.",
-    "difficulty_note": "Tests multi-hop conceptual matching, forcing the RAG to distinguish between the 'Exfiltration' tactic and the 'Command and Control' tactic."
+  "id": "q008",
+  "query": "What's it called when attackers steal data by sneaking it right out through the exact same server connection they're already using to control their malware?",
+  "category": "mitre",
+  "difficulty": "medium",
+  "expected_technique_ids": ["T1041"],
+  "expected_cve_ids": [],
+  "expected_retrieval": true,
+  "expected_answer_summary": "Adversaries exfiltrate data over the existing Command and Control (C2) channel to avoid creating new, suspicious outbound network connections.",
+  "difficulty_note": "Tests multi-hop conceptual matching, forcing the RAG to distinguish between the 'Exfiltration' tactic and the 'Command and Control' tactic."
 },
 
 {
-    "query": "What is the primary Microsoft Windows administration system, built on Web-Based Enterprise Management standards, that attackers commonly abuse to execute code and interact with local and remote systems?",
-    "category": "mitre",
-    "difficulty": "medium",
-    "expected_technique_ids": ["T1047"],
-    "expected_cve_ids": [],
-    "expected_retrieval": true,
-    "expected_answer_summary": "Windows Management Instrumentation is abused to execute commands, often via the wmic utility or through scripts interacting with its namespaces.",
-    "difficulty_note": "Tests entity extraction based on the underlying Microsoft technology description rather than the standard 'WMI' acronym."
+  "id": "q009",
+  "query": "What is the primary Microsoft Windows administration system, built on Web-Based Enterprise Management standards, that attackers commonly abuse to execute code and interact with local and remote systems?",
+  "category": "mitre",
+  "difficulty": "medium",
+  "expected_technique_ids": ["T1047"],
+  "expected_cve_ids": [],
+  "expected_retrieval": true,
+  "expected_answer_summary": "Windows Management Instrumentation is abused to execute commands, often via the wmic utility or through scripts interacting with its namespaces.",
+  "difficulty_note": "Tests entity extraction based on the underlying Microsoft technology description rather than the standard 'WMI' acronym."
 },
 
 {
-    "query": "Once initial access is achieved, what technique covers the act of bringing additional malware, scanning utilities, or secondary payloads from an external attacker-controlled server onto the compromised system?",
-    "category": "mitre",
-    "difficulty": "easy",
-    "expected_technique_ids": ["T1105"],
-    "expected_cve_ids": [],
-    "expected_retrieval": true,
-    "expected_answer_summary": "Adversaries use this technique to download or pull files into the compromised environment using native tools or custom protocols.",
-    "difficulty_note": "Tests basic definition matching without using keywords like 'download' or 'ingress'."
+  "id": "q010",
+  "query": "Once initial access is achieved, what technique covers the act of bringing additional malware, scanning utilities, or secondary payloads from an external attacker-controlled server onto the compromised system?",
+  "category": "mitre",
+  "difficulty": "easy",
+  "expected_technique_ids": ["T1105"],
+  "expected_cve_ids": [],
+  "expected_retrieval": true,
+  "expected_answer_summary": "Adversaries use this technique to download or pull files into the compromised environment using native tools or custom protocols.",
+  "difficulty_note": "Tests basic definition matching without using keywords like 'download' or 'ingress'."
 },
 
 {
+  "id": "q011",
   "query": "What is CVE-2012-4681 and why is it on CISA's known-exploited list?",
   "category": "kev",
   "difficulty": "easy",
@@ -121,6 +132,7 @@
 },
 
 {
+  "id": "q012",
   "query": "What is CVE-2016-3715 and why is it on CISA's known-exploited list?",
   "category": "kev",
   "difficulty": "easy",
@@ -132,6 +144,7 @@
 },
 
 {
+  "id": "q013",
   "query": "Which Microsoft GDI flaw allowing privilege escalation is in the exploited catalog?",
   "category": "kev",
   "difficulty": "medium",
@@ -143,6 +156,7 @@
 },
 
 {
+  "id": "q014",
   "query": "Is there a known actively-exploited vulnerability in the Figma desktop application?",
   "category": "kev",
   "difficulty": "hard",
@@ -154,6 +168,7 @@
 },
 
 {
+  "id": "q015",
   "query": "Is the remote code execution flaw in Cisco IP Phones' web server listed as actively exploited, and what attack technique covers exploiting an internet-facing service like this?",
   "category": "cross",
   "difficulty": "hard",
@@ -165,6 +180,7 @@
 },
 
 {
+  "id": "q016",
   "query": "Is there an actively-exploited remote code execution flaw in Microsoft's SMB protocol, and what MITRE technique describes exploiting a remote service to move through a network?",
   "category": "cross",
   "difficulty": "hard",
@@ -176,6 +192,7 @@
 },
 
 {
+  "id": "q017",
   "query": "What's the capital of Italy?",
   "category": "off-topic",
   "difficulty": "easy",
@@ -187,6 +204,7 @@
 },
 
 {
+  "id": "q018",
   "query": "How old are you?",
   "category": "off-topic",
   "difficulty": "easy",
@@ -198,6 +216,7 @@
 },
 
 {
+  "id": "q019",
   "query": "What's scope of ML in Cybersecurity?",
   "category": "off-topic",
   "difficulty": "hard",
@@ -209,6 +228,7 @@
 },
 
 {
+  "id": "q020",
   "query": "How to write an email?",
   "category": "off-topic",
   "difficulty": "easy",
