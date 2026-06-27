@@ -67,11 +67,12 @@ class AnalysisResult:
     success:          bool
     source_citations: list[dict] = field(default_factory=list)
     error:            str | None = None
+    context_used:     list[str] = field(default_factory=list)
 
     @classmethod
-    def ok(cls, answer: str, citations: list[dict]) -> "AnalysisResult":
+    def ok(cls, answer: str, citations: list[dict], context_used: list[str]) -> "AnalysisResult":
         """Factory for successful generation."""
-        return cls(answer=answer, success=True, source_citations=citations)
+        return cls(answer=answer, success=True, source_citations=citations, context_used=context_used)
 
     @classmethod
     def fail(cls, error: str) -> "AnalysisResult":
@@ -399,4 +400,4 @@ class ThreatAnalyzer:
                 seen.add(tid)
                 unique_citations.append(meta)
 
-        return AnalysisResult.ok(answer=answer, citations=unique_citations)
+        return AnalysisResult.ok(answer=answer, citations=unique_citations, context_used=context_chunks)
