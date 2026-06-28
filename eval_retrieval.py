@@ -17,7 +17,7 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 # ─── Pinned Baseline ──────────────────────────────────────────────────────────
-# The retrieval baseline (precision 0.2389 / recall 0.4667) was captured at K=3.
+# The retrieval baseline (precision 0.2444 / recall 0.5667) was captured at K=3.
 # The per-row `eligible` flag and recall@K only mean what the downstream
 # faithfulness gate expects if K matches this pin. If config.RETRIEVAL_TOP_K ever
 # diverges from 3, eligibility semantics silently change — so we guard, not assume.
