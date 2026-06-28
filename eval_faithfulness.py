@@ -56,7 +56,7 @@ if not RECALL_BASELINE_RUN_ID:
         "artifact or record lineage."
     )
 
-# Artifact DIRECTORY within the run (not the file). Issue 1 logged the JSON
+# Artifact DIRECTORY within the run (not the file). Issue 9 logged the JSON
 # under a temp filename, so we target the folder and find the single JSON
 # inside rather than hardcoding a non-deterministic name.
 RECALL_ARTIFACT_DIR = "per_row_metrics"
