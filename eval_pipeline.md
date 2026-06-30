@@ -91,7 +91,7 @@ Six rows never returned the correct chunk in the top 3, so they were gated out o
 - **Exact-identifier — q011, q012.** Both queries are dominated by a CVE number ("What is CVE-2012-4681...", "What is CVE-2016-3715..."). Their `expected_technique_ids` are empty — these are CVE lookups, not technique lookups, so recall is measured against whether the right *CVE entry* came back, not a technique. A CVE ID is a near-opaque token: `all-MiniLM-L6-v2` embeds semantic meaning, and the ID carries almost none, so the query embedding lands in a generic "some vulnerability" region and the exact entry doesn't surface. With no technique vocabulary to fall back on, these are the cleanest possible illustration of dense retrieval failing on exact identifiers. *Fix: hybrid (dense + lexical/metadata-exact) retrieval — ADR candidate.*
 
 - **Multi-hop / compositional — q005, q016.** q005 expects three techniques (T1078, T1098, T1111 — defeat MFA, valid accounts, modify account settings); q016 expects a CVE plus T1210. A single query embedding averages across the clauses and matches none of them strongly enough to retrieve every required chunk in the top 3. The corpus has the answers; one embedding can't retrieve a
-multi-part answer. *Fix: query decomposition in the agentic routing layer*
+multi-part answer. *Fix: query decomposition — a separate operation from collection routing, which selects a corpus but does not split a multi-clause query into sub-queries.*
 
 - **Vocabulary mismatch — q008, q010.** The answers exist (T1041 Exfiltration Over C2 Channel; T1105 Ingress Tool Transfer) but the queries are written in plain English with zero MITRE vocabulary ("sneaking data out through the same connection they use to control their malware"). The chunks are written in technical terms; the embeddings don't bridge the gap. *Fix: query expansion or a reranker; partly an inherent embedding-model limit.*
 
@@ -102,8 +102,8 @@ multi-part answer. *Fix: query decomposition in the agentic routing layer*
 | q009 | Generation | Legitimate refusal (bad gold) | Eval-set revision |
 | q013 | Generation | Over-refusal (strict prompt) | Prompt loosening |
 | q015 | Mixed | Over-refusal + retrieval miss | Prompt + routing |
-| q005 | Retrieval | Multi-hop (T1078/T1098/T1111) | Routing (Wk 2) |
-| q016 | Retrieval | Multi-hop (CVE + T1210) | Routing (Wk 2) |
+| q005 | Retrieval | Multi-hop (T1078/T1098/T1111) | Query decomposition |
+| q016 | Retrieval | Multi-hop (CVE + T1210) | Query decomposition |
 | q008 | Retrieval | Vocabulary mismatch (T1041) | Query expansion / reranker |
 | q010 | Retrieval | Vocabulary mismatch (T1105) | Query expansion / reranker |
 | q011 | Retrieval | Exact-identifier (CVE, no technique) | Hybrid retrieval (ADR) |
