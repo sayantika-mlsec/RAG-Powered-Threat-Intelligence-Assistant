@@ -6,6 +6,14 @@ Startup contract:
   - ./brain/         must exist (pre-built ChromaDB, committed to repo)
   - GEMINI_API_KEY   must be set as a HF Space Secret (or in local .env)
   - process_directory() is NOT called here — ingest offline, commit ./brain/
+
+Routing (Phase 2 Wk 2):
+  - run_pipeline(query, use_routing=...) is the single entry point called by
+    BOTH this UI and the eval harness. use_routing is the only A/B variable:
+    False = blind baseline (whole store), True = agentic (route decides corpus).
+  - ROUTER_CLIENT uses the new google.genai SDK; ANALYZER still uses the legacy
+    google.generativeai SDK. This dual-SDK coexistence is a known, parked
+    migration — not an oversight.
 """
 
 import os
@@ -14,8 +22,11 @@ import gradio as gr
 from pathlib import Path
 from dotenv import load_dotenv
 
+from google import genai
+
 from ingest      import ThreatIntelDB
 from threat_analyzer  import ThreatAnalyzer, AnalysisResult
+from routing     import route_query, Route
 
 # ── Logging ───────────────────────────────────────────────────────────────────
 logging.basicConfig(
@@ -304,9 +315,136 @@ def _initialize_systems() -> tuple[ThreatIntelDB | None, ThreatAnalyzer | None, 
     return db, analyzer, status
 
 
+def _initialize_router_client() -> genai.Client | None:
+    """
+    Constructs the google.genai client used by the routing layer.
+
+    Separate from ANALYZER on purpose: the router runs on the new google.genai
+    SDK (consistent with routing.py / eval_faithfulness.py) while ThreatAnalyzer
+    still runs on the legacy google.generativeai SDK. Both read the same
+    GEMINI_API_KEY. Consolidating to one SDK is a tracked, parked migration.
+
+    Returns None on failure (e.g. missing key) so the UI can degrade to the
+    blind-retrieval path instead of crashing at module load.
+    """
+    api_key = os.getenv("GEMINI_API_KEY")
+    if not api_key:
+        logger.warning("GEMINI_API_KEY not set — router unavailable, blind retrieval only.")
+        return None
+    try:
+        client = genai.Client(api_key=api_key)
+        logger.info("Router client ready (google.genai).")
+        return client
+    except Exception as e:
+        logger.error(f"Router client init failed: {e}", exc_info=True)
+        return None
+
+
 # Initialize once at module load
 DB, ANALYZER, INIT_STATUS = _initialize_systems()
+ROUTER_CLIENT = _initialize_router_client()
 logger.info(f"Startup status: {INIT_STATUS}")
+
+
+# ── Routing resolver ──────────────────────────────────────────────────────────
+
+# Sentinel returned by _route_to_corpus for the skip route. Distinct from None
+# (which means "no filter, query the whole store") so the two cannot be confused.
+SKIP_SENTINEL = "__skip__"
+
+
+def _route_to_corpus(route: Route) -> str | None:
+    """
+    Map a Route to the `corpus` argument for semantic_search.
+
+      MITRE_ONLY -> "mitre"        (filter to MITRE chunks)
+      KEV_ONLY   -> "kev"          (filter to KEV chunks)
+      BOTH       -> None           (no filter — query the whole store)
+      SKIP       -> SKIP_SENTINEL  (caller must not retrieve at all)
+
+    Unmapped route raises. A silent default to None (BOTH) would reintroduce
+    blind retrieval — the exact behavior routing exists to remove — and would
+    quietly corrupt the routing-vs-baseline A/B. Fail loud instead.
+    """
+    if route == Route.MITRE_ONLY:
+        return "mitre"
+    if route == Route.KEV_ONLY:
+        return "kev"
+    if route == Route.BOTH:
+        return None
+    if route == Route.SKIP:
+        return SKIP_SENTINEL
+    raise ValueError(f"Unmapped route: {route!r}")
+
+
+# ── Pipeline ──────────────────────────────────────────────────────────────────
+
+def run_pipeline(
+    query: str,
+    *,
+    use_routing: bool,
+) -> tuple[AnalysisResult, dict, str | None]:
+    """
+    Full RAG pipeline — the single entry point shared by the Gradio UI and the
+    eval harness. `use_routing` is the ONLY variable that changes between the
+    blind baseline and the agentic version, which is what keeps Friday's A/B
+    single-variable:
+
+        use_routing=False -> query the whole store (byte-identical to the
+                             pre-routing baseline: precision 0.2389 / recall 0.4667)
+        use_routing=True  -> route_query decides the corpus, then retrieval is
+                             filtered to it
+
+    Returns (result, search_results, route_value):
+        result         : AnalysisResult from the generation layer
+        search_results : the raw dict from semantic_search (same shape either
+                         path, so downstream citation/status formatting is
+                         unchanged)
+        route_value    : the route string when routing ran, else None — for
+                         logging and eval attribution
+
+    The skip route currently returns a clean failure. The real no-retrieval
+    response path is Thursday's task; until then it fails loudly rather than
+    silently falling through to a search.
+    """
+    empty_results = {"documents": [[]], "metadatas": [[]], "error": None}
+    route_value: str | None = None
+
+    if use_routing:
+        if ROUTER_CLIENT is None:
+            # Router unavailable (e.g. missing key). Do not silently fall back to
+            # blind retrieval — that would misattribute the A/B. Fail visibly.
+            return (
+                AnalysisResult.fail("Router unavailable — check GEMINI_API_KEY."),
+                empty_results,
+                None,
+            )
+
+        decision = route_query(query, ROUTER_CLIENT)
+        route_value = decision.route.value
+        logger.info(f"Route: {route_value}  ·  reasoning: {decision.reasoning[:120]}")
+
+        corpus = _route_to_corpus(decision.route)
+
+        if corpus == SKIP_SENTINEL:
+            # Thursday builds the real direct-LLM no-retrieval path. For now,
+            # return a clean, clearly-flagged failure rather than retrieving.
+            return (
+                AnalysisResult.fail(
+                    "Query routed to SKIP — no retrieval performed "
+                    "(no-retrieval response handler pending)."
+                ),
+                empty_results,
+                route_value,
+            )
+
+        search_results = DB.semantic_search(query, n_results=N_RESULTS, corpus=corpus)
+    else:
+        # Blind baseline — no filter, whole store.
+        search_results = DB.semantic_search(query, n_results=N_RESULTS)
+
+    result = ANALYZER.generate_answer(query, search_results)
+    return result, search_results, route_value
 
 
 # ── Core Query Handler ────────────────────────────────────────────────────────
@@ -342,14 +480,9 @@ def handle_query(query: str) -> tuple[str, str, str]:
             f"❌ {INIT_STATUS}"
         )
 
-    # ── RAG pipeline ──────────────────────────────────────────────────────────
+    # ── RAG pipeline (routing on) ─────────────────────────────────────────────
     try:
-        # Layer 1: Semantic search
-        search_results = DB.semantic_search(query, n_results=N_RESULTS)
-
-        # Layer 2: Generation
-        result: AnalysisResult = ANALYZER.generate_answer(query, search_results)
-
+        result, search_results, route_value = run_pipeline(query, use_routing=True)
     except Exception as e:
         logger.error(f"Unhandled pipeline error: {e}", exc_info=True)
         return (
@@ -360,10 +493,11 @@ def handle_query(query: str) -> tuple[str, str, str]:
 
     # ── Format outputs ────────────────────────────────────────────────────────
     if not result.success:
+        route_note = f"  ·  route: {route_value}" if route_value else ""
         return (
             result.error or "Analysis failed.",
             "",
-            "⚠  Query could not be answered — see response above."
+            f"⚠  Query could not be answered — see response above.{route_note}"
         )
 
     # Format citations as a clean readable block
@@ -385,10 +519,12 @@ def handle_query(query: str) -> tuple[str, str, str]:
         citations_text = "No ATT&CK technique citations available."
 
     chunk_count = len(search_results.get("documents", [[]])[0])
+    route_note = f"  ·  route: {route_value}" if route_value else ""
     status_text = (
         f"✓  {chunk_count} chunk(s) retrieved  ·  "
         f"{len(result.source_citations)} technique(s) cited  ·  "
         f"{len(result.answer)} chars generated"
+        f"{route_note}"
     )
 
     return result.answer, citations_text, status_text
