@@ -130,15 +130,18 @@ class ThreatIntelDB:
                     )
 
                 # ── Metadata Extraction ──────────────────────────────────────
-                technique_id = (
-                    _extract_field(raw_text, "TECHNIQUE_ID")
-                    or _extract_field(raw_text, "VULNERABILITY_ID")
-                )
-                if not technique_id:
-                    technique_id = filename.removesuffix(".txt")
+                mitre_id = _extract_field(raw_text, "TECHNIQUE_ID")
+                kev_id   = _extract_field(raw_text, "VULNERABILITY_ID")
+
+                if mitre_id:
+                    technique_id, corpus = mitre_id, "mitre"
+                elif kev_id:
+                    technique_id, corpus = kev_id, "kev"
+                else:
+                    technique_id, corpus = filename.removesuffix(".txt"), "unknown"
                     logger.warning(
                         f"[{filename}] No TECHNIQUE_ID or VULNERABILITY_ID found — "
-                        f"falling back to filename: '{technique_id}'"
+                        f"corpus='unknown', falling back to filename: '{technique_id}'"
                     )
 
                 tactic = _extract_field(raw_text, "TACTIC")
@@ -158,6 +161,7 @@ class ThreatIntelDB:
                         "source":       filename,
                         "type":         "threat_intel_report",
                         "technique_id": technique_id,
+                        "corpus":       corpus,
                         "tactic":       tactic,
                         "date_added":   date_added,
                     }]
@@ -190,7 +194,7 @@ class ThreatIntelDB:
         )
         return stats
 
-    def semantic_search(self, query: str, n_results: int = 3) -> dict:
+    def semantic_search(self, query: str, n_results: int = 3, corpus: str|None = None) -> dict:
         """
         Executes a semantic similarity search against the collection.
 
@@ -225,10 +229,10 @@ class ThreatIntelDB:
             )
 
         try:
-            results = self.collection.query(
-                query_texts=[query.strip()],
-                n_results=effective_n
-            )
+            query_kwargs = {"query_texts": [query.strip()], "n_results": effective_n}
+            if corpus is not None:
+                query_kwargs["where"] = {"corpus": corpus}
+            results = self.collection.query(**query_kwargs)
             hit_count = len(results["documents"][0])
             logger.info(f"Search returned {hit_count} result(s) for query: '{query[:80]}'")
             # Attach error key so callers never need to check for its absence
