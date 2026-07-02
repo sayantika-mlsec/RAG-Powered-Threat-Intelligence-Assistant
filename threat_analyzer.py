@@ -52,33 +52,26 @@ GENERATION_CONFIG = genai.types.GenerationConfig(
 
 @dataclass
 class AnalysisResult:
-    """
-    FIX 2: Replaces bare str return from generate_answer().
-
-    Callers (Gradio, tests, CLI) check `success` to branch UI state:
-      - success=True  → render answer + source_citations
-      - success=False → render error state (red border, warning icon, etc.)
-
-    source_citations carries the metadatas from ChromaDB so the UI can
-    display which ATT&CK techniques contributed to the answer — a hard
-    roadmap requirement that a bare string return made impossible.
-    """
     answer:           str
     success:          bool
     source_citations: list[dict] = field(default_factory=list)
     error:            str | None = None
     context_used:     list[str] = field(default_factory=list)
+    mode:             str = "retrieved"   # "retrieved" | "no_retrieval"
 
     @classmethod
     def ok(cls, answer: str, citations: list[dict], context_used: list[str]) -> "AnalysisResult":
-        """Factory for successful generation."""
         return cls(answer=answer, success=True, source_citations=citations, context_used=context_used)
 
     @classmethod
     def fail(cls, error: str) -> "AnalysisResult":
-        """Factory for any failure path — validation, upstream, or LLM."""
         return cls(answer="", success=False, source_citations=[], error=error)
 
+    @classmethod
+    def no_retrieval(cls, answer: str) -> "AnalysisResult":
+        """Skip-route success: answered directly, no context retrieved.
+        success=True (not a failure) but mode flags the absence of grounding."""
+        return cls(answer=answer, success=True, source_citations=[],context_used=[], mode="no_retrieval")
 
 # ── Module-level prompt utilities ─────────────────────────────────────────────
 # Defined at module level, NOT inside generate_answer():

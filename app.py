@@ -7,7 +7,7 @@ Startup contract:
   - GEMINI_API_KEY   must be set as a HF Space Secret (or in local .env)
   - process_directory() is NOT called here — ingest offline, commit ./brain/
 
-Routing (Phase 2 Wk 2):
+Routing:
   - run_pipeline(query, use_routing=...) is the single entry point called by
     BOTH this UI and the eval harness. use_routing is the only A/B variable:
     False = blind baseline (whole store), True = agentic (route decides corpus).
@@ -23,10 +23,11 @@ from pathlib import Path
 from dotenv import load_dotenv
 
 from google import genai
+from google.genai import types
 
 from ingest      import ThreatIntelDB
 from threat_analyzer  import ThreatAnalyzer, AnalysisResult
-from routing     import route_query, Route
+from routing     import route_query, Route, _ROUTER_MODEL
 
 # ── Logging ───────────────────────────────────────────────────────────────────
 logging.basicConfig(
@@ -377,6 +378,57 @@ def _route_to_corpus(route: Route) -> str | None:
     raise ValueError(f"Unmapped route: {route!r}")
 
 
+# ── Skip-route no-retrieval response ──────────────────────────────────────────
+
+# System instruction for the skip path. The citation prohibition is load-bearing:
+# skip runs with NO retrieved context, so any technique ID or CVE the model emits
+# is necessarily ungrounded (hallucinated). Forbidding them keeps the skip path
+# from silently bypassing the retrieval-grounding contract the rest of the
+# pipeline enforces.
+NO_RETRIEVAL_SYSTEM_INSTRUCTION = (
+    "You are a threat-intelligence assistant. This query was routed 'skip' — it "
+    "needs no knowledge-base lookup (a greeting, a capability/meta question, or "
+    "an off-topic message). Answer briefly and directly. Do NOT cite, invent, or "
+    "reference any MITRE ATT&CK technique IDs (e.g. T1059) or CVE identifiers — no "
+    "threat-intel context was retrieved to support them. If the query actually "
+    "needs threat-intel data, say it would need to be looked up rather than "
+    "answering from memory."
+)
+
+
+def _no_retrieval_response(query: str) -> AnalysisResult:
+    """Skip-route response: a direct LLM answer with no retrieval.
+
+    Returns AnalysisResult with success=True and mode='no_retrieval' — a clean
+    success, distinct from a genuine failure. Runs on the router's google.genai
+    client and the same model as the router (_ROUTER_MODEL), keeping the skip
+    path off the parked legacy SDK and consistent with the routing decision.
+    """
+    if ROUTER_CLIENT is None:
+        # Shouldn't happen — run_pipeline guards ROUTER_CLIENT before routing —
+        # but fail loud rather than call .models on None.
+        return AnalysisResult.fail("Skip path reached but router client unavailable.")
+    try:
+        response = ROUTER_CLIENT.models.generate_content(
+            model=_ROUTER_MODEL,
+            contents=query,
+            config=types.GenerateContentConfig(
+                system_instruction=NO_RETRIEVAL_SYSTEM_INSTRUCTION,
+                temperature=0.0,
+                thinking_config=types.ThinkingConfig(thinking_budget=0),
+            ),
+        )
+        text = response.text
+        if not text:
+            # An empty direct answer is a real failure, not a valid no-retrieval
+            # success — do not dress it up as one.
+            return AnalysisResult.fail("Skip path returned an empty response.")
+        return AnalysisResult.no_retrieval(answer=text)
+    except Exception as e:
+        logger.error(f"Skip-path generation failed for '{query[:80]}': {e}", exc_info=True)
+        return AnalysisResult.fail("Direct (no-retrieval) response generation failed.")
+
+
 # ── Pipeline ──────────────────────────────────────────────────────────────────
 
 def run_pipeline(
@@ -403,9 +455,9 @@ def run_pipeline(
         route_value    : the route string when routing ran, else None — for
                          logging and eval attribution
 
-    The skip route currently returns a clean failure. The real no-retrieval
-    response path is Thursday's task; until then it fails loudly rather than
-    silently falling through to a search.
+    The skip route returns a direct no-retrieval response (mode='no_retrieval'),
+    a clean success distinct from a failure. Nothing touches ChromaDB on that
+    path.
     """
     empty_results = {"documents": [[]], "metadatas": [[]], "error": None}
     route_value: str | None = None
@@ -427,13 +479,10 @@ def run_pipeline(
         corpus = _route_to_corpus(decision.route)
 
         if corpus == SKIP_SENTINEL:
-            # Thursday builds the real direct-LLM no-retrieval path. For now,
-            # return a clean, clearly-flagged failure rather than retrieving.
+            # Direct no-retrieval response — a clean success flagged
+            # mode='no_retrieval', not a failure. Nothing touches ChromaDB here.
             return (
-                AnalysisResult.fail(
-                    "Query routed to SKIP — no retrieval performed "
-                    "(no-retrieval response handler pending)."
-                ),
+                _no_retrieval_response(query),
                 empty_results,
                 route_value,
             )
@@ -498,6 +547,16 @@ def handle_query(query: str) -> tuple[str, str, str]:
             result.error or "Analysis failed.",
             "",
             f"⚠  Query could not be answered — see response above.{route_note}"
+        )
+
+    # No-retrieval (skip) success — direct answer, no citations by design.
+    if result.mode == "no_retrieval":
+        route_note = f"  ·  route: {route_value}" if route_value else ""
+        return (
+            result.answer,
+            "No retrieval performed for this query (no-retrieval mode).",
+            f"✓  direct response  ·  no retrieval  ·  "
+            f"{len(result.answer)} chars generated{route_note}"
         )
 
     # Format citations as a clean readable block
