@@ -435,6 +435,7 @@ def run_pipeline(
     query: str,
     *,
     use_routing: bool,
+    n_results: int = N_RESULTS,
 ) -> tuple[AnalysisResult, dict, str | None]:
     """
     Full RAG pipeline — the single entry point shared by the Gradio UI and the
@@ -443,7 +444,7 @@ def run_pipeline(
     single-variable:
 
         use_routing=False -> query the whole store (byte-identical to the
-                             pre-routing baseline: precision 0.2389 / recall 0.4667)
+                             pre-routing baseline: precision 0.2444 / recall 0.5667)
         use_routing=True  -> route_query decides the corpus, then retrieval is
                              filtered to it
 
@@ -487,10 +488,10 @@ def run_pipeline(
                 route_value,
             )
 
-        search_results = DB.semantic_search(query, n_results=N_RESULTS, corpus=corpus)
+        search_results = DB.semantic_search(query, n_results=n_results, corpus=corpus)
     else:
         # Blind baseline — no filter, whole store.
-        search_results = DB.semantic_search(query, n_results=N_RESULTS)
+        search_results = DB.semantic_search(query, n_results=n_results)
 
     result = ANALYZER.generate_answer(query, search_results)
     return result, search_results, route_value
