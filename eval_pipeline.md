@@ -1,6 +1,6 @@
 # RAG Evaluation Pipeline
 
-How the Threat Intelligence RAG assistant is evaluated, why these metrics were chosen, and what the baseline measurement found. The pipeline scores the single-pass (blind-retrieval) RAG; the agentic routing layer is evaluated against this same harness later and compared to these numbers.
+How the Threat Intelligence RAG assistant is evaluated, why these metrics were chosen, and what the baseline measurement found. The pipeline scores the single-pass (blind-retrieval) RAG; the agentic routing layer is evaluated against this same harness and compared to these numbers (see **Routing arm results**).
 
 ## Why evaluate at all
 
@@ -110,3 +110,40 @@ multi-part answer. *Fix: query decomposition — a separate operation from colle
 | q012 | Retrieval | Exact-identifier (CVE, no technique) | Hybrid retrieval (ADR) |
 
 No fixes are applied in this issue — it characterizes failures. Generation over-refusal and the judge blind spot inform the prompt and metric work; multi-hop and vocabulary-mismatch retrieval inform the routing layer; exact-identifier retrieval is the hybrid-retrieval ADR candidate.
+
+## Routing arm results
+
+The agentic routing layer was evaluated against the same K=3 harness and compared to the blind baseline. `use_routing=True` sends each query through `route_query`, which picks a corpus (`mitre_only`, `kev_only`, `both`, or `skip`); retrieval is then filtered to the routed corpus instead of querying the whole store.
+
+### Retrieval — routed vs blind
+
+| Metric | Blind baseline | Routed | Delta |
+|---|---|---|---|
+| Precision@3 | 0.2444 | 0.2444 | 0.0000 |
+| Recall@3 | 0.5667 | 0.5667 | 0.0000 |
+| n_misroutes | — | 0 | — |
+| Reconciliation | OK | OK (scored + gated == total) | — |
+
+**The result is flat, and that is the finding.** Routing changed neither precision nor recall at K=3, with zero misroutes. Read together, those two facts localize what routing does and does not do:
+
+- **Routing did its job.** `n_misroutes = 0` means every scored query reached the correct corpus — no query was sent to the wrong store or wrongly skipped. Corpus selection is correct.
+- **Correct corpus selection did not move top-3.** The store imbalance the routing layer was built to counter (540 MITRE chunks vs 1600 KEV) does distort deeper ranks — a MITRE query under `both` competes against 1600 KEV chunks — but for this eval set the correct chunks were *already ranking in the top 3 under blind retrieval*. Filtering out wrong-corpus chunks that sat at rank 4+ changed nothing about which three chunks won the top-3 slots. Routing removed noise that K=3 never saw.
+
+### Per-category breakdown
+
+| Corpus | Difficulty | Precision@3 | Recall@3 |
+|---|---|---|---|
+| cross | hard | 0.1667 | 0.2500 |
+| kev | easy | 0.0000 | 0.0000 |
+| kev | medium | 0.6667 | 1.0000 |
+| mitre | easy | 0.0000 | 0.0000 |
+| mitre | hard | 0.3333 | 0.7500 |
+| mitre | medium | 0.2667 | 0.8000 |
+
+The two `easy` buckets sit at 0.0000/0.0000 for both corpora — and with `n_misroutes = 0`, this is **not** a routing failure. These queries were correctly routed, hit the correct store, and the right chunks still did not come back in the top 3. That places the residual failure squarely at the retrieval layer, not the routing layer — the exact-identifier and vocabulary-mismatch modes already characterized in the baseline failure analysis (q008/q010/q011/q012). Routing cannot fix them because they were never routing problems.
+
+### What this run establishes
+
+Agentic routing held precision constant at K=3 while eliminating misroutes; the residual precision ceiling is a retrieval-layer problem, not a corpus-selection one. This is the measured evidence — not a prediction — behind the hybrid-retrieval ADR: routing is the right tool for corpus selection and the wrong tool for exact-identifier and vocab-mismatch lookup, and the data now shows exactly that separation. A flat precision delta with a clean misroute count is a stronger localization of the next bottleneck than a precision bump would have been.
+
+> **Faithfulness (routed arm): pending.** The routed retrieval run above is only the precision half of the A/B. Routed faithfulness has not yet been scored, and precision-flat says nothing about whether routing changed answer grounding — that is a separate distribution. Before scoring, `RECALL_BASELINE_RUN_ID` must be repointed at *this* routed retrieval run's id, or routed answers get gated against blind eligibility. Routed faithfulness numbers and any routed row in the baseline table are deliberately omitted until that run lands.
