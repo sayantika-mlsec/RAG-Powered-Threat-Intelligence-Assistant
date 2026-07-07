@@ -5,10 +5,12 @@ row so misroutes are visible alongside the model's own reasoning. This is the
 manual "do the routes look sane" gate before wiring routing into retrieval; it
 asserts nothing and is safe to re-run (idempotent against a fixed eval_set.json).
 
-A per-call throttle keeps the run under the free-tier per-minute request quota:
-routing calls share the project's quota pool, so spacing them out lets all rows
+A per-call throttle keeps the run under the per-minute request quota: routing
+calls share the project's quota pool, so spacing them out lets all rows
 complete in one pass instead of erroring partway through. Default is 6s/call
-(~10 req/min); raise --delay if still rate-limited, lower it if quota allows.
+(~10 req/min) — conservative for Vertex's paid tier, but left as-is until the
+actual ceiling is confirmed in the Cloud Console. Raise --delay if rate-limited,
+lower it once you've confirmed headroom.
 
 Usage:
     python inspect_routes.py                  # all rows, throttled
@@ -19,20 +21,22 @@ Usage:
 
 import argparse
 import json
-import os
 import time
 from pathlib import Path
 
 from dotenv import load_dotenv
-from google import genai
 
+# Load .env BEFORE importing config, unconditionally. config.py reads
+# GCP_PROJECT_ID at import time — if this file (or anything it imports) reaches
+# `import config` before .env is loaded, that import fails outright.
+load_dotenv(dotenv_path=Path(__file__).parent / ".env", override=True)
+
+from gemini_client import get_client
 from routing import route_query
 
 import config
 
-THROTTLE_SECONDS = 6  # ~10 req/min; safe under typical free-tier per-minute limits
-
-load_dotenv(dotenv_path=Path(__file__).parent / ".env", override=True)
+THROTTLE_SECONDS = 6  # ~10 req/min — see module docstring
 
 
 def load_rows():
@@ -52,11 +56,7 @@ def main():
     )
     args = ap.parse_args()
 
-    api_key = os.getenv("GEMINI_API_KEY")
-    if not api_key:
-        raise ValueError("GEMINI_API_KEY not found. Check your .env file.")
-
-    client = genai.Client(api_key=api_key)
+    client = get_client()
 
     rows = load_rows()
     if args.ids:

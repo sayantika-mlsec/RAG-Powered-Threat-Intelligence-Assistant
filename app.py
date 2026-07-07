@@ -3,17 +3,20 @@ app.py — Gradio UI for the RAG-Powered Threat Intelligence Assistant
 Entry point for Hugging Face Spaces deployment.
 
 Startup contract:
-  - ./brain/         must exist (pre-built ChromaDB, committed to repo)
-  - GEMINI_API_KEY   must be set as a HF Space Secret (or in local .env)
+  - ./brain/                        must exist (pre-built ChromaDB, committed to repo)
+  - GCP_PROJECT_ID / GCP_LOCATION   must be set (.env locally, or HF Space Secrets),
+                                     plus valid Vertex credentials (ADC locally,
+                                     or a service account key on HF Spaces)
   - process_directory() is NOT called here — ingest offline, commit ./brain/
 
 Routing:
   - run_pipeline(query, use_routing=...) is the single entry point called by
     BOTH this UI and the eval harness. use_routing is the only A/B variable:
     False = blind baseline (whole store), True = agentic (route decides corpus).
-  - ROUTER_CLIENT uses the new google.genai SDK; ANALYZER still uses the legacy
-    google.generativeai SDK. This dual-SDK coexistence is a known, parked
-    migration — not an oversight.
+  - ROUTER_CLIENT and ANALYZER now share ONE Vertex-backed client via
+    gemini_client.get_client() — the dual-SDK split (google.genai vs the
+    legacy google.generativeai) that used to exist here is gone; both were
+    migrated off the shared AI-Studio free-tier pool onto Vertex.
 """
 
 import os
@@ -22,12 +25,21 @@ import gradio as gr
 from pathlib import Path
 from dotenv import load_dotenv
 
+# Load .env BEFORE any of the project's own modules are imported. Several of
+# them (gemini_client.py, threat_analyzer.py, and transitively config.py)
+# read GCP_PROJECT_ID / GCP_LOCATION at import time. This file's correctness
+# shouldn't depend on which of those modules happens to load .env first —
+# loading it here, first, makes app.py self-contained regardless of internal
+# ordering inside the modules it imports.
+load_dotenv(dotenv_path=Path(__file__).parent / ".env", override=False)
+
 from google import genai
 from google.genai import types
 
 from ingest      import ThreatIntelDB
 from threat_analyzer  import ThreatAnalyzer, AnalysisResult
 from routing     import route_query, Route, _ROUTER_MODEL
+from gemini_client import get_client
 
 # ── Logging ───────────────────────────────────────────────────────────────────
 logging.basicConfig(
@@ -35,10 +47,6 @@ logging.basicConfig(
     format="%(asctime)s - %(levelname)s - %(name)s - %(message)s"
 )
 logger = logging.getLogger(__name__)
-
-# ── Environment ───────────────────────────────────────────────────────────────
-# Loads .env locally; on HF Spaces the Secret is already in the environment.
-load_dotenv(dotenv_path=Path(__file__).parent / ".env", override=False)
 
 # ── Constants ─────────────────────────────────────────────────────────────────
 DB_PATH    = "./brain"
@@ -300,17 +308,18 @@ def _initialize_systems() -> tuple[ThreatIntelDB | None, ThreatAnalyzer | None, 
         return None, None, f"❌ DB init failed: {e}"
 
     # ── Analyzer init ─────────────────────────────────────────────────────────
+    # Single Exception handler now: ThreatAnalyzer no longer reads any API key
+    # (get_client() carries Vertex auth internally), so the old ValueError
+    # branch for "missing GEMINI_API_KEY" is dead code — nothing raises that
+    # way anymore. Whatever DOES go wrong here (bad GCP_PROJECT_ID, missing
+    # ADC, no billing) surfaces through this one path instead.
     try:
         analyzer = ThreatAnalyzer()
         logger.info("ThreatAnalyzer ready.")
         analyzer_status = "LLM: ready"
-    except ValueError as e:
-        # Missing API key — common on first HF deploy, surface clearly
-        logger.error(f"ThreatAnalyzer init failed: {e}")
-        return db, None, f"❌ LLM init failed — check GEMINI_API_KEY Secret: {e}"
     except Exception as e:
         logger.error(f"ThreatAnalyzer init failed: {e}", exc_info=True)
-        return db, None, f"❌ LLM init failed: {e}"
+        return db, None, f"❌ LLM init failed — check GCP_PROJECT_ID/ADC: {e}"
 
     status = f"[ {db_status}  ·  {analyzer_status} ]"
     return db, analyzer, status
@@ -318,24 +327,24 @@ def _initialize_systems() -> tuple[ThreatIntelDB | None, ThreatAnalyzer | None, 
 
 def _initialize_router_client() -> genai.Client | None:
     """
-    Constructs the google.genai client used by the routing layer.
+    Constructs the shared Vertex-backed client used by the routing layer.
 
-    Separate from ANALYZER on purpose: the router runs on the new google.genai
-    SDK (consistent with routing.py / eval_faithfulness.py) while ThreatAnalyzer
-    still runs on the legacy google.generativeai SDK. Both read the same
-    GEMINI_API_KEY. Consolidating to one SDK is a tracked, parked migration.
+    Wrapped in try/except: get_client() runs at MODULE LOAD (see
+    ROUTER_CLIENT = _initialize_router_client() below), so a misconfiguration
+    (bad GCP_PROJECT_ID, missing ADC, quota-project not set) must not crash
+    the whole app before it can serve a single request. Instead it degrades
+    to blind retrieval — the same fallback contract this function always had.
 
-    Returns None on failure (e.g. missing key) so the UI can degrade to the
-    blind-retrieval path instead of crashing at module load.
+    ANALYZER and ROUTER_CLIENT now come from the SAME get_client() — one
+    Vertex-backed client, one quota pool. The dual-SDK split this function's
+    docstring used to describe (google.genai vs legacy google.generativeai)
+    no longer exists; both were migrated onto Vertex.
+
+    Returns None on failure so the UI can degrade to the blind-retrieval path
+    instead of crashing at module load.
     """
-    api_key = os.getenv("GEMINI_API_KEY")
-    if not api_key:
-        logger.warning("GEMINI_API_KEY not set — router unavailable, blind retrieval only.")
-        return None
     try:
-        client = genai.Client(api_key=api_key)
-        logger.info("Router client ready (google.genai).")
-        return client
+        return get_client()
     except Exception as e:
         logger.error(f"Router client init failed: {e}", exc_info=True)
         return None
@@ -400,9 +409,9 @@ def _no_retrieval_response(query: str) -> AnalysisResult:
     """Skip-route response: a direct LLM answer with no retrieval.
 
     Returns AnalysisResult with success=True and mode='no_retrieval' — a clean
-    success, distinct from a genuine failure. Runs on the router's google.genai
+    success, distinct from a genuine failure. Runs on the shared Vertex-backed
     client and the same model as the router (_ROUTER_MODEL), keeping the skip
-    path off the parked legacy SDK and consistent with the routing decision.
+    path consistent with the routing decision.
     """
     if ROUTER_CLIENT is None:
         # Shouldn't happen — run_pipeline guards ROUTER_CLIENT before routing —
@@ -465,10 +474,11 @@ def run_pipeline(
 
     if use_routing:
         if ROUTER_CLIENT is None:
-            # Router unavailable (e.g. missing key). Do not silently fall back to
-            # blind retrieval — that would misattribute the A/B. Fail visibly.
+            # Router unavailable (e.g. bad GCP_PROJECT_ID / missing ADC). Do
+            # not silently fall back to blind retrieval — that would
+            # misattribute the A/B. Fail visibly.
             return (
-                AnalysisResult.fail("Router unavailable — check GEMINI_API_KEY."),
+                AnalysisResult.fail("Router unavailable — check GCP_PROJECT_ID/ADC (see gemini_client.py)."),
                 empty_results,
                 None,
             )
@@ -525,7 +535,7 @@ def handle_query(query: str) -> tuple[str, str, str]:
 
     if ANALYZER is None:
         return (
-            "System unavailable — LLM failed to initialize. Check GEMINI_API_KEY.",
+            "System unavailable — LLM failed to initialize. Check GCP_PROJECT_ID/ADC.",
             "",
             f"❌ {INIT_STATUS}"
         )

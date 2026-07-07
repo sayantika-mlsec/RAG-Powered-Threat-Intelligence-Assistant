@@ -20,15 +20,17 @@ import re
 import json
 import time
 import logging
+import tempfile
 from pathlib import Path
 
-from google import genai as genai_new         # new unified SDK — judge uses this for thinking control
 from google.genai import types as genai_types
 from dotenv import load_dotenv
 import mlflow
 from mlflow.artifacts import download_artifacts
 
 import config
+
+from gemini_client import get_client
 
 logging.basicConfig(
     level=logging.INFO,
@@ -135,23 +137,41 @@ def load_capture_artifact(path: str) -> dict[str, dict]:
 def load_partial_scores(path: str) -> dict[str, dict]:
     """
     Load already-judged rows from a prior interrupted run, keyed by id.
-    Returns {} if no scratch file exists. Lets a re-run resume after a quota
-    cutoff instead of re-spending judge calls on rows already scored.
+    Returns {} if no scratch file exists, OR if it exists but is corrupt (e.g.
+    a torn write from a hard kill) — treated the same as "nothing judged yet"
+    rather than crashing resume before a single row is attempted.
     """
     p = Path(path)
     if not p.exists():
         return {}
-    rows = json.loads(p.read_text(encoding="utf-8"))
+    try:
+        rows = json.loads(p.read_text(encoding="utf-8"))
+    except json.JSONDecodeError:
+        logger.warning(f"{path} is corrupt — starting fresh (prior judged rows lost).")
+        return {}
     scored = {r["id"]: r for r in rows}
     logger.info(f"Resuming: {len(scored)} row(s) already judged in scratch file.")
     return scored
 
 
 def save_partial_scores(path: str, scored: dict[str, dict]) -> None:
-    """Persist judged rows after each call so progress survives interruption."""
-    Path(path).write_text(
-        json.dumps(list(scored.values()), indent=2), encoding="utf-8"
-    )
+    """
+    Persist judged rows after each call, atomically. Writes to a temp file in
+    the same directory, then os.replace()'s it over path — atomic on both
+    POSIX and Windows, so a crash mid-write can't leave a half-written scratch
+    file for the next resume to choke on. The whole point of checkpointing
+    after every call is defeated if the checkpoint itself can be corrupted by
+    the same crash it's meant to survive.
+    """
+    out_dir = Path(path).parent or Path(".")
+    fd, tmp_path = tempfile.mkstemp(dir=out_dir, suffix=".tmp")
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            json.dump(list(scored.values()), f, indent=2)
+        os.replace(tmp_path, path)
+    except Exception:
+        os.unlink(tmp_path)
+        raise
 
 
 # ── Judge ─────────────────────────────────────────────────────────────────────
@@ -292,13 +312,7 @@ def run_faithfulness(recall_run_id: str, capture_path: str) -> None:
         return
 
     # ── Judge each eligible row ───────────────────────────────────────────────
-    api_key = os.getenv("GEMINI_API_KEY")
-    if not api_key:
-        raise ValueError("GEMINI_API_KEY not found. Check your .env file.")
-    # New google.genai SDK client — needed for thinking_budget control (the old
-    # google.generativeai SDK has no ThinkingConfig). System instruction +
-    # thinking config are passed per-call in judge_faithfulness.
-    judge_client = genai_new.Client(api_key=api_key)
+    judge_client = get_client()
     judge_model_name = os.getenv("GEMINI_MODEL_NAME", "gemini-2.5-flash")
 
     # Resume from any prior interrupted run — only judge rows not already scored.
@@ -324,7 +338,7 @@ def run_faithfulness(recall_run_id: str, capture_path: str) -> None:
         )
         made_live_call = True
         scored[rid] = {"id": rid, "faithfulness": score, "reason": reason}
-        save_partial_scores(SCORES_SCRATCH_PATH, scored)   # persist after each call
+        save_partial_scores(SCORES_SCRATCH_PATH, scored)   # persist after each call, atomically
         logger.info(f"Judged {rid}: faithfulness={score}")
 
     # Only here, with all N scored, do we compute the mean and log to MLflow.
@@ -345,7 +359,7 @@ def run_faithfulness(recall_run_id: str, capture_path: str) -> None:
         # produced eligibility (not a loose file we have to trust).
         mlflow.log_param("recall_run_id", recall_run_id)
         mlflow.log_param("capture_artifact", capture_path)
-        mlflow.log_param("judge_model", os.getenv("GEMINI_MODEL_NAME", "gemini-2.5-flash"))
+        mlflow.log_param("judge_model", judge_model_name)
         mlflow.log_dict(
             {
                 "faithfulness_mean": mean_faithfulness,
@@ -373,5 +387,10 @@ def run_faithfulness(recall_run_id: str, capture_path: str) -> None:
 if __name__ == "__main__":
     # Recall comes from MLflow by run id (RECALL_BASELINE_RUN_ID, from .env,
     # validated at module load). Capture is the local artifact from this issue.
+    #
+    # ⚠️ TRAP: this is hardcoded to the BLIND arm. Scoring the
+    # ROUTED arm means changing this to "generation_capture_routed.json" AND
+    # repointing RECALL_BASELINE_RUN_ID in .env to the routed retrieval run —
+    # miss either one and routed answers silently gate against blind eligibility.
     CAPTURE_ARTIFACT = "generation_capture.json"
     run_faithfulness(RECALL_BASELINE_RUN_ID, CAPTURE_ARTIFACT)

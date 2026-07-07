@@ -26,6 +26,19 @@ import os
 import tempfile
 import time
 from pathlib import Path
+from dotenv import load_dotenv
+
+# Load .env HERE, explicitly, before importing app. app.py also calls
+# load_dotenv() internally, and today that happens to run before config gets
+# imported (via gemini_client) inside app.py's own init — so this currently
+# "works" without this line. But that correctness is borrowed from app.py's
+# internal import order, not owned by this script. If app.py's imports ever
+# get reordered — a plausible, innocent refactor — this script breaks with a
+# KeyError three files away from the line that actually needs the fix. Calling
+# load_dotenv() again here is cheap (idempotent, override=True just re-applies
+# the same values) and makes this script's correctness self-contained instead
+# of borrowed.
+load_dotenv(dotenv_path=Path(__file__).parent / ".env", override=True)
 
 # run_pipeline is the single shared entry point (same function the Gradio UI
 # calls). Importing it triggers app.py's module-load init of DB / ANALYZER /
@@ -38,9 +51,11 @@ from pathlib import Path
 from app import run_pipeline
 import config
 
-# Seconds to sleep between live LLM calls, to stay under the free-tier
-# per-minute rate limit. Free tier is ~10 RPM, so ~6s spacing keeps us safe.
-# Applied only between rows that actually hit the API — reused rows cost nothing.
+# Seconds to sleep between live LLM calls. Tuned for AI Studio's ~10 RPM
+# free-tier ceiling. Now on Vertex AI (project-billed, higher per-minute
+# limits) — this spacing is safely conservative rather than load-bearing, but
+# left as-is until the actual Vertex quota ceiling is confirmed in the Cloud
+# Console. Lower it later, deliberately, not by accident.
 THROTTLE_SECONDS = 6
 
 logging.basicConfig(

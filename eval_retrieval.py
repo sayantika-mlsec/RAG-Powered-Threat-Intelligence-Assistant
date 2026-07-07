@@ -6,6 +6,17 @@ import tempfile
 import os
 import time
 from collections import defaultdict
+from pathlib import Path
+from dotenv import load_dotenv
+
+# Load .env BEFORE importing config. config.py reads GCP_PROJECT_ID /
+# GCP_LOCATION at import time (module-level), so if load_dotenv only ran
+# later — conditionally, inside __main__, only for the routed arm, as it did
+# before this migration — plain `import config` could fail before a single
+# line of this script's logic runs, even for the blind arm that needs no
+# Gemini calls at all. Loading here, unconditionally, first, removes that
+# hidden ordering dependency entirely.
+load_dotenv(dotenv_path=Path(__file__).parent / ".env", override=True)
 
 from ingest import ThreatIntelDB
 from routing import route_query, Route
@@ -283,8 +294,6 @@ def run_evaluation(
 
 if __name__ == "__main__":
     import argparse
-    from dotenv import load_dotenv
-    from pathlib import Path
 
     ap = argparse.ArgumentParser()
     ap.add_argument("--use-routing", action="store_true",
@@ -293,12 +302,11 @@ if __name__ == "__main__":
 
     client = None
     if args.use_routing:
-        from google import genai
-        load_dotenv(dotenv_path=Path(__file__).parent / ".env", override=True)
-        api_key = os.getenv("GEMINI_API_KEY")
-        if not api_key:
-            raise ValueError("GEMINI_API_KEY not found. Check your .env file.")
-        client = genai.Client(api_key=api_key)
+        # One shared client, Vertex-backed — no API key, no separate SDK
+        # config here. Auth and quota now live with gcloud ADC + the GCP
+        # project, not a per-file `genai.Client(api_key=...)` call.
+        from gemini_client import get_client
+        client = get_client()
 
     mlflow.set_experiment(config.MLFLOW_EXPERIMENT_NAME)
     run_name = "retrieval_eval_routed" if args.use_routing else "retrieval_eval_blind"
