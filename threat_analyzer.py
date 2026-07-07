@@ -1,12 +1,25 @@
 import os
 import html
 import logging
-import google.generativeai as genai
-import google.api_core.exceptions
 from dataclasses import dataclass, field
 from dotenv import load_dotenv
 from pathlib import Path
 
+from google.genai import types as genai_types
+from google.genai import errors as genai_errors
+
+from gemini_client import get_client
+
+# ── Environment ───────────────────────────────────────────────────────────────
+# Loaded BEFORE `import config`, not after. This file is imported by app.py via
+# `from threat_analyzer import ThreatAnalyzer` — and that import happens BEFORE
+# app.py calls its own load_dotenv(). So the very first time `config` gets
+# imported anywhere in the whole process is right here, with nothing having
+# loaded .env yet. Since config.py now reads GCP_PROJECT_ID at import time
+# (Vertex migration), `import config` below would fail before the Gradio app
+# even finishes starting up. Loading .env first, in this file, removes that
+# dependency on being imported in a lucky order.
+load_dotenv(dotenv_path=Path(__file__).parent / ".env", override=True)
 
 import config
 
@@ -16,9 +29,6 @@ logging.basicConfig(
     format="%(asctime)s - %(levelname)s - %(name)s - %(message)s"
 )
 logger = logging.getLogger(__name__)
-
-# ── Environment ───────────────────────────────────────────────────────────────
-load_dotenv(dotenv_path=Path(__file__).parent / ".env", override=True)
 
 
 # Model name as env variable — changing models in production = update .env, not code
@@ -35,7 +45,10 @@ SYSTEM_INSTRUCTION = (
     "Do not speculate. Do not use prior knowledge. Do not invent IOCs, techniques, or sources."
 )
 
-GENERATION_CONFIG = genai.types.GenerationConfig(
+# System instruction now travels WITH the generation config, passed per call —
+# the new SDK has no persistent "model" object to bake it into (see __init__).
+GENERATION_CONFIG = genai_types.GenerateContentConfig(
+    system_instruction=SYSTEM_INSTRUCTION,
     temperature=0.0,
     # top_p and top_k intentionally omitted:
     # at temperature=0.0 greedy decoding is active — sampling parameters
@@ -44,7 +57,7 @@ GENERATION_CONFIG = genai.types.GenerationConfig(
     # NOTE: temperature=0.0 produces near-deterministic output but is NOT
     # guaranteed deterministic due to floating-point ops across GPU cores.
     max_output_tokens=2048,
-    candidate_count=1
+    candidate_count=1,
 )
 
 
@@ -52,33 +65,26 @@ GENERATION_CONFIG = genai.types.GenerationConfig(
 
 @dataclass
 class AnalysisResult:
-    """
-    FIX 2: Replaces bare str return from generate_answer().
-
-    Callers (Gradio, tests, CLI) check `success` to branch UI state:
-      - success=True  → render answer + source_citations
-      - success=False → render error state (red border, warning icon, etc.)
-
-    source_citations carries the metadatas from ChromaDB so the UI can
-    display which ATT&CK techniques contributed to the answer — a hard
-    roadmap requirement that a bare string return made impossible.
-    """
     answer:           str
     success:          bool
     source_citations: list[dict] = field(default_factory=list)
     error:            str | None = None
     context_used:     list[str] = field(default_factory=list)
+    mode:             str = "retrieved"   # "retrieved" | "no_retrieval"
 
     @classmethod
     def ok(cls, answer: str, citations: list[dict], context_used: list[str]) -> "AnalysisResult":
-        """Factory for successful generation."""
         return cls(answer=answer, success=True, source_citations=citations, context_used=context_used)
 
     @classmethod
     def fail(cls, error: str) -> "AnalysisResult":
-        """Factory for any failure path — validation, upstream, or LLM."""
         return cls(answer="", success=False, source_citations=[], error=error)
 
+    @classmethod
+    def no_retrieval(cls, answer: str) -> "AnalysisResult":
+        """Skip-route success: answered directly, no context retrieved.
+        success=True (not a failure) but mode flags the absence of grounding."""
+        return cls(answer=answer, success=True, source_citations=[], context_used=[], mode="no_retrieval")
 
 # ── Module-level prompt utilities ─────────────────────────────────────────────
 # Defined at module level, NOT inside generate_answer():
@@ -115,7 +121,7 @@ def _truncate_chunks(
         every cited source actually contributed text to the answer.
 
     Returns (truncated_chunks, matching_metadatas) — always the same length.
-    
+
     Truncates chunks dynamically by pulling limits directly from the global config.
     """
     result_chunks: list[str]  = []
@@ -127,7 +133,7 @@ def _truncate_chunks(
 
     # Enforce the chunk count limit
     for chunk, meta in zip(chunks[:max_chunks], metadatas[:max_chunks]):
-        
+
         # Enforce the character limit per chunk
         if len(chunk) > max_chars:
             chunk = chunk[:max_chars]
@@ -135,7 +141,7 @@ def _truncate_chunks(
                 f"Chunk from '{meta.get('source', 'unknown')}' truncated to "
                 f"{max_chars} chars."
             )
-            
+
         result_chunks.append(chunk)
         result_metas.append(meta)
 
@@ -165,30 +171,30 @@ def _build_prompt(query: str, context_chunks: list[str]) -> str:
 
 def _safe_extract_text(response) -> tuple[str | None, str | None]:
     """
-    Safely extracts text from a Gemini response object.
+    Safely extracts text from a Gemini response object (new google.genai SDK).
     Returns (text, error_reason) — exactly one will be None.
 
-    Accessing response.text directly raises ValueError when Gemini's
-    safety filter blocks a response. This function checks all failure
-    modes explicitly before touching .text, distinguishing:
-      - Prompt-level blocks  (input was rejected)
-      - Candidate-level safety filters
-      - Unexpected finish reasons
-      - Genuine successful responses
+    Checks prompt-level blocks, then candidate-level finish reasons, before
+    touching .text — same failure taxonomy as before, adapted to the new
+    response shape (defensive getattr, since prompt_feedback may be absent
+    entirely when nothing was blocked, rather than present-but-empty).
     """
-    if response.prompt_feedback.block_reason:
-        return None, f"PROMPT_BLOCKED:{response.prompt_feedback.block_reason.name}"
+    prompt_feedback = getattr(response, "prompt_feedback", None)
+    block_reason = getattr(prompt_feedback, "block_reason", None) if prompt_feedback else None
+    if block_reason:
+        return None, f"PROMPT_BLOCKED:{block_reason.name}"
 
     if not response.candidates:
         return None, "NO_CANDIDATES"
 
-    finish_reason = response.candidates[0].finish_reason.name
+    finish_reason = response.candidates[0].finish_reason
+    finish_reason_name = finish_reason.name if finish_reason else "UNKNOWN"
 
-    if finish_reason == "SAFETY":
+    if finish_reason_name == "SAFETY":
         return None, "CANDIDATE_SAFETY_FILTERED"
 
-    if finish_reason not in ("STOP", "MAX_TOKENS"):
-        return None, f"UNEXPECTED_FINISH:{finish_reason}"
+    if finish_reason_name not in ("STOP", "MAX_TOKENS"):
+        return None, f"UNEXPECTED_FINISH:{finish_reason_name}"
 
     return response.text, None
 
@@ -201,22 +207,22 @@ class ThreatAnalyzer:
 
     Class design (vs module-level initialization):
       - Instantiated explicitly — testable and mockable
-      - self.model can be swapped in tests without module-level patching
-      - Model name and config changes are isolated to __init__
+      - self.client can be swapped in tests without module-level patching
+      - Model name and config changes are isolated to __init__ / module constants
     """
 
     def __init__(self):
-        """Initializes the analyzer pulling strictly from config.py"""
-        api_key = os.getenv("GEMINI_API_KEY")
-        if not api_key:
-            raise ValueError("GEMINI_API_KEY not found. Check your .env file.")
+        """
+        Initializes the analyzer on the shared Vertex-backed client.
 
-        genai.configure(api_key=api_key)
-        self.model = genai.GenerativeModel(
-            model_name=MODEL_NAME,
-            system_instruction=SYSTEM_INSTRUCTION,
-            generation_config=GENERATION_CONFIG
-        )
+        No API key, no genai.configure() — get_client() carries Vertex auth
+        (project + ADC) internally. There is also no persistent "model" object
+        in the new SDK the way there was in the legacy one: system_instruction
+        and generation params now travel per-call inside GENERATION_CONFIG
+        (see module level), not baked into an object here.
+        """
+        self.client = get_client()
+        self.model_name = MODEL_NAME
 
     # ── Input validation ──────────────────────────────────────────────────────
 
@@ -227,11 +233,11 @@ class ThreatAnalyzer:
         """
         if not query or not isinstance(query, str):
             return None, "Invalid query."
-        
+
         query = query.strip()
         if len(query) < 3:
             return None, "Query too short."
-        
+
         # Pull directly from config
         if len(query) > config.MAX_QUERY_LENGTH:
             query = query[:config.MAX_QUERY_LENGTH]
@@ -288,17 +294,30 @@ class ThreatAnalyzer:
 
     def _call_llm(self, prompt: str, query: str) -> tuple[str | None, str | None]:
         """
-        Calls the Gemini API with explicit handling for every failure mode.
-        Returns (answer_text, error_reason) — exactly one will be None.
+        Calls the Gemini API (Vertex, via the new google.genai SDK) with
+        explicit handling for every failure mode. Returns (answer_text,
+        error_reason) — exactly one will be None.
 
         Failure taxonomy:
           - Safety blocks     → security signal, log at WARNING, return user-safe message
           - Quota exhaustion  → operational signal, log at ERROR
           - Malformed request → developer signal, log at ERROR
           - Unexpected errors → catch-all with full stack trace (exc_info=True)
+
+        Exception types changed with the SDK: the legacy google.api_core
+        exceptions (ResourceExhausted, InvalidArgument) don't exist on this
+        SDK's error surface. The new SDK raises google.genai.errors.ClientError
+        (4xx, carries .code — 429 is quota) and .ServerError (5xx). Catching the
+        old exception classes here would compile fine but never actually match
+        anything — every real error would silently fall through to the generic
+        catch-all with a less specific message.
         """
         try:
-            response = self.model.generate_content(prompt)
+            response = self.client.models.generate_content(
+                model=self.model_name,
+                contents=prompt,
+                config=GENERATION_CONFIG,
+            )
             text, error_reason = _safe_extract_text(response)
 
             if error_reason:
@@ -320,13 +339,16 @@ class ThreatAnalyzer:
             logger.info(f"Generation successful. Response length: {len(text)} chars.")
             return text, None
 
-        except google.api_core.exceptions.ResourceExhausted:
-            logger.error("Gemini API quota exhausted. Implement exponential backoff.")
-            return None, "Service temporarily unavailable — API quota reached."
-
-        except google.api_core.exceptions.InvalidArgument as e:
+        except genai_errors.ClientError as e:
+            if getattr(e, "code", None) == 429:
+                logger.error("Gemini API quota exhausted. Implement exponential backoff.")
+                return None, "Service temporarily unavailable — API quota reached."
             logger.error(f"Malformed request to Gemini API: {e}")
             return None, "An error occurred during threat analysis."
+
+        except genai_errors.ServerError as e:
+            logger.error(f"Gemini API server error: {e}")
+            return None, "Service temporarily unavailable — try again shortly."
 
         except Exception as e:
             # exc_info=True attaches the full stack trace — saves hours of debugging.

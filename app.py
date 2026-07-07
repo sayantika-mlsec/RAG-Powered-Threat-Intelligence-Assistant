@@ -3,9 +3,20 @@ app.py — Gradio UI for the RAG-Powered Threat Intelligence Assistant
 Entry point for Hugging Face Spaces deployment.
 
 Startup contract:
-  - ./brain/         must exist (pre-built ChromaDB, committed to repo)
-  - GEMINI_API_KEY   must be set as a HF Space Secret (or in local .env)
+  - ./brain/                        must exist (pre-built ChromaDB, committed to repo)
+  - GCP_PROJECT_ID / GCP_LOCATION   must be set (.env locally, or HF Space Secrets),
+                                     plus valid Vertex credentials (ADC locally,
+                                     or a service account key on HF Spaces)
   - process_directory() is NOT called here — ingest offline, commit ./brain/
+
+Routing:
+  - run_pipeline(query, use_routing=...) is the single entry point called by
+    BOTH this UI and the eval harness. use_routing is the only A/B variable:
+    False = blind baseline (whole store), True = agentic (route decides corpus).
+  - ROUTER_CLIENT and ANALYZER now share ONE Vertex-backed client via
+    gemini_client.get_client() — the dual-SDK split (google.genai vs the
+    legacy google.generativeai) that used to exist here is gone; both were
+    migrated off the shared AI-Studio free-tier pool onto Vertex.
 """
 
 import os
@@ -14,8 +25,21 @@ import gradio as gr
 from pathlib import Path
 from dotenv import load_dotenv
 
+# Load .env BEFORE any of the project's own modules are imported. Several of
+# them (gemini_client.py, threat_analyzer.py, and transitively config.py)
+# read GCP_PROJECT_ID / GCP_LOCATION at import time. This file's correctness
+# shouldn't depend on which of those modules happens to load .env first —
+# loading it here, first, makes app.py self-contained regardless of internal
+# ordering inside the modules it imports.
+load_dotenv(dotenv_path=Path(__file__).parent / ".env", override=False)
+
+from google import genai
+from google.genai import types
+
 from ingest      import ThreatIntelDB
 from threat_analyzer  import ThreatAnalyzer, AnalysisResult
+from routing     import route_query, Route, _ROUTER_MODEL
+from gemini_client import get_client
 
 # ── Logging ───────────────────────────────────────────────────────────────────
 logging.basicConfig(
@@ -23,10 +47,6 @@ logging.basicConfig(
     format="%(asctime)s - %(levelname)s - %(name)s - %(message)s"
 )
 logger = logging.getLogger(__name__)
-
-# ── Environment ───────────────────────────────────────────────────────────────
-# Loads .env locally; on HF Spaces the Secret is already in the environment.
-load_dotenv(dotenv_path=Path(__file__).parent / ".env", override=False)
 
 # ── Constants ─────────────────────────────────────────────────────────────────
 DB_PATH    = "./brain"
@@ -288,25 +308,203 @@ def _initialize_systems() -> tuple[ThreatIntelDB | None, ThreatAnalyzer | None, 
         return None, None, f"❌ DB init failed: {e}"
 
     # ── Analyzer init ─────────────────────────────────────────────────────────
+    # Single Exception handler now: ThreatAnalyzer no longer reads any API key
+    # (get_client() carries Vertex auth internally), so the old ValueError
+    # branch for "missing GEMINI_API_KEY" is dead code — nothing raises that
+    # way anymore. Whatever DOES go wrong here (bad GCP_PROJECT_ID, missing
+    # ADC, no billing) surfaces through this one path instead.
     try:
         analyzer = ThreatAnalyzer()
         logger.info("ThreatAnalyzer ready.")
         analyzer_status = "LLM: ready"
-    except ValueError as e:
-        # Missing API key — common on first HF deploy, surface clearly
-        logger.error(f"ThreatAnalyzer init failed: {e}")
-        return db, None, f"❌ LLM init failed — check GEMINI_API_KEY Secret: {e}"
     except Exception as e:
         logger.error(f"ThreatAnalyzer init failed: {e}", exc_info=True)
-        return db, None, f"❌ LLM init failed: {e}"
+        return db, None, f"❌ LLM init failed — check GCP_PROJECT_ID/ADC: {e}"
 
     status = f"[ {db_status}  ·  {analyzer_status} ]"
     return db, analyzer, status
 
 
+def _initialize_router_client() -> genai.Client | None:
+    """
+    Constructs the shared Vertex-backed client used by the routing layer.
+
+    Wrapped in try/except: get_client() runs at MODULE LOAD (see
+    ROUTER_CLIENT = _initialize_router_client() below), so a misconfiguration
+    (bad GCP_PROJECT_ID, missing ADC, quota-project not set) must not crash
+    the whole app before it can serve a single request. Instead it degrades
+    to blind retrieval — the same fallback contract this function always had.
+
+    ANALYZER and ROUTER_CLIENT now come from the SAME get_client() — one
+    Vertex-backed client, one quota pool. The dual-SDK split this function's
+    docstring used to describe (google.genai vs legacy google.generativeai)
+    no longer exists; both were migrated onto Vertex.
+
+    Returns None on failure so the UI can degrade to the blind-retrieval path
+    instead of crashing at module load.
+    """
+    try:
+        return get_client()
+    except Exception as e:
+        logger.error(f"Router client init failed: {e}", exc_info=True)
+        return None
+
+
 # Initialize once at module load
 DB, ANALYZER, INIT_STATUS = _initialize_systems()
+ROUTER_CLIENT = _initialize_router_client()
 logger.info(f"Startup status: {INIT_STATUS}")
+
+
+# ── Routing resolver ──────────────────────────────────────────────────────────
+
+# Sentinel returned by _route_to_corpus for the skip route. Distinct from None
+# (which means "no filter, query the whole store") so the two cannot be confused.
+SKIP_SENTINEL = "__skip__"
+
+
+def _route_to_corpus(route: Route) -> str | None:
+    """
+    Map a Route to the `corpus` argument for semantic_search.
+
+      MITRE_ONLY -> "mitre"        (filter to MITRE chunks)
+      KEV_ONLY   -> "kev"          (filter to KEV chunks)
+      BOTH       -> None           (no filter — query the whole store)
+      SKIP       -> SKIP_SENTINEL  (caller must not retrieve at all)
+
+    Unmapped route raises. A silent default to None (BOTH) would reintroduce
+    blind retrieval — the exact behavior routing exists to remove — and would
+    quietly corrupt the routing-vs-baseline A/B. Fail loud instead.
+    """
+    if route == Route.MITRE_ONLY:
+        return "mitre"
+    if route == Route.KEV_ONLY:
+        return "kev"
+    if route == Route.BOTH:
+        return None
+    if route == Route.SKIP:
+        return SKIP_SENTINEL
+    raise ValueError(f"Unmapped route: {route!r}")
+
+
+# ── Skip-route no-retrieval response ──────────────────────────────────────────
+
+# System instruction for the skip path. The citation prohibition is load-bearing:
+# skip runs with NO retrieved context, so any technique ID or CVE the model emits
+# is necessarily ungrounded (hallucinated). Forbidding them keeps the skip path
+# from silently bypassing the retrieval-grounding contract the rest of the
+# pipeline enforces.
+NO_RETRIEVAL_SYSTEM_INSTRUCTION = (
+    "You are a threat-intelligence assistant. This query was routed 'skip' — it "
+    "needs no knowledge-base lookup (a greeting, a capability/meta question, or "
+    "an off-topic message). Answer briefly and directly. Do NOT cite, invent, or "
+    "reference any MITRE ATT&CK technique IDs (e.g. T1059) or CVE identifiers — no "
+    "threat-intel context was retrieved to support them. If the query actually "
+    "needs threat-intel data, say it would need to be looked up rather than "
+    "answering from memory."
+)
+
+
+def _no_retrieval_response(query: str) -> AnalysisResult:
+    """Skip-route response: a direct LLM answer with no retrieval.
+
+    Returns AnalysisResult with success=True and mode='no_retrieval' — a clean
+    success, distinct from a genuine failure. Runs on the shared Vertex-backed
+    client and the same model as the router (_ROUTER_MODEL), keeping the skip
+    path consistent with the routing decision.
+    """
+    if ROUTER_CLIENT is None:
+        # Shouldn't happen — run_pipeline guards ROUTER_CLIENT before routing —
+        # but fail loud rather than call .models on None.
+        return AnalysisResult.fail("Skip path reached but router client unavailable.")
+    try:
+        response = ROUTER_CLIENT.models.generate_content(
+            model=_ROUTER_MODEL,
+            contents=query,
+            config=types.GenerateContentConfig(
+                system_instruction=NO_RETRIEVAL_SYSTEM_INSTRUCTION,
+                temperature=0.0,
+                thinking_config=types.ThinkingConfig(thinking_budget=0),
+            ),
+        )
+        text = response.text
+        if not text:
+            # An empty direct answer is a real failure, not a valid no-retrieval
+            # success — do not dress it up as one.
+            return AnalysisResult.fail("Skip path returned an empty response.")
+        return AnalysisResult.no_retrieval(answer=text)
+    except Exception as e:
+        logger.error(f"Skip-path generation failed for '{query[:80]}': {e}", exc_info=True)
+        return AnalysisResult.fail("Direct (no-retrieval) response generation failed.")
+
+
+# ── Pipeline ──────────────────────────────────────────────────────────────────
+
+def run_pipeline(
+    query: str,
+    *,
+    use_routing: bool,
+    n_results: int = N_RESULTS,
+) -> tuple[AnalysisResult, dict, str | None]:
+    """
+    Full RAG pipeline — the single entry point shared by the Gradio UI and the
+    eval harness. `use_routing` is the ONLY variable that changes between the
+    blind baseline and the agentic version, which is what keeps Friday's A/B
+    single-variable:
+
+        use_routing=False -> query the whole store (byte-identical to the
+                             pre-routing baseline: precision 0.2444 / recall 0.5667)
+        use_routing=True  -> route_query decides the corpus, then retrieval is
+                             filtered to it
+
+    Returns (result, search_results, route_value):
+        result         : AnalysisResult from the generation layer
+        search_results : the raw dict from semantic_search (same shape either
+                         path, so downstream citation/status formatting is
+                         unchanged)
+        route_value    : the route string when routing ran, else None — for
+                         logging and eval attribution
+
+    The skip route returns a direct no-retrieval response (mode='no_retrieval'),
+    a clean success distinct from a failure. Nothing touches ChromaDB on that
+    path.
+    """
+    empty_results = {"documents": [[]], "metadatas": [[]], "error": None}
+    route_value: str | None = None
+
+    if use_routing:
+        if ROUTER_CLIENT is None:
+            # Router unavailable (e.g. bad GCP_PROJECT_ID / missing ADC). Do
+            # not silently fall back to blind retrieval — that would
+            # misattribute the A/B. Fail visibly.
+            return (
+                AnalysisResult.fail("Router unavailable — check GCP_PROJECT_ID/ADC (see gemini_client.py)."),
+                empty_results,
+                None,
+            )
+
+        decision = route_query(query, ROUTER_CLIENT)
+        route_value = decision.route.value
+        logger.info(f"Route: {route_value}  ·  reasoning: {decision.reasoning[:120]}")
+
+        corpus = _route_to_corpus(decision.route)
+
+        if corpus == SKIP_SENTINEL:
+            # Direct no-retrieval response — a clean success flagged
+            # mode='no_retrieval', not a failure. Nothing touches ChromaDB here.
+            return (
+                _no_retrieval_response(query),
+                empty_results,
+                route_value,
+            )
+
+        search_results = DB.semantic_search(query, n_results=n_results, corpus=corpus)
+    else:
+        # Blind baseline — no filter, whole store.
+        search_results = DB.semantic_search(query, n_results=n_results)
+
+    result = ANALYZER.generate_answer(query, search_results)
+    return result, search_results, route_value
 
 
 # ── Core Query Handler ────────────────────────────────────────────────────────
@@ -337,19 +535,14 @@ def handle_query(query: str) -> tuple[str, str, str]:
 
     if ANALYZER is None:
         return (
-            "System unavailable — LLM failed to initialize. Check GEMINI_API_KEY.",
+            "System unavailable — LLM failed to initialize. Check GCP_PROJECT_ID/ADC.",
             "",
             f"❌ {INIT_STATUS}"
         )
 
-    # ── RAG pipeline ──────────────────────────────────────────────────────────
+    # ── RAG pipeline (routing on) ─────────────────────────────────────────────
     try:
-        # Layer 1: Semantic search
-        search_results = DB.semantic_search(query, n_results=N_RESULTS)
-
-        # Layer 2: Generation
-        result: AnalysisResult = ANALYZER.generate_answer(query, search_results)
-
+        result, search_results, route_value = run_pipeline(query, use_routing=True)
     except Exception as e:
         logger.error(f"Unhandled pipeline error: {e}", exc_info=True)
         return (
@@ -360,10 +553,21 @@ def handle_query(query: str) -> tuple[str, str, str]:
 
     # ── Format outputs ────────────────────────────────────────────────────────
     if not result.success:
+        route_note = f"  ·  route: {route_value}" if route_value else ""
         return (
             result.error or "Analysis failed.",
             "",
-            "⚠  Query could not be answered — see response above."
+            f"⚠  Query could not be answered — see response above.{route_note}"
+        )
+
+    # No-retrieval (skip) success — direct answer, no citations by design.
+    if result.mode == "no_retrieval":
+        route_note = f"  ·  route: {route_value}" if route_value else ""
+        return (
+            result.answer,
+            "No retrieval performed for this query (no-retrieval mode).",
+            f"✓  direct response  ·  no retrieval  ·  "
+            f"{len(result.answer)} chars generated{route_note}"
         )
 
     # Format citations as a clean readable block
@@ -385,10 +589,12 @@ def handle_query(query: str) -> tuple[str, str, str]:
         citations_text = "No ATT&CK technique citations available."
 
     chunk_count = len(search_results.get("documents", [[]])[0])
+    route_note = f"  ·  route: {route_value}" if route_value else ""
     status_text = (
         f"✓  {chunk_count} chunk(s) retrieved  ·  "
         f"{len(result.source_citations)} technique(s) cited  ·  "
         f"{len(result.answer)} chars generated"
+        f"{route_note}"
     )
 
     return result.answer, citations_text, status_text

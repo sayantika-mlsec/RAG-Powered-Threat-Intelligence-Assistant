@@ -1,6 +1,6 @@
 # RAG Evaluation Pipeline
 
-How the Threat Intelligence RAG assistant is evaluated, why these metrics were chosen, and what the baseline measurement found. The pipeline scores the single-pass (blind-retrieval) RAG; the agentic routing layer is evaluated against this same harness later and compared to these numbers.
+How the Threat Intelligence RAG assistant is evaluated, why these metrics were chosen, and what the baseline measurement found. The pipeline scores the single-pass (blind-retrieval) RAG; the agentic routing layer is evaluated against this same harness and compared to these numbers (see **Routing arm results**).
 
 ## Why evaluate at all
 
@@ -91,7 +91,7 @@ Six rows never returned the correct chunk in the top 3, so they were gated out o
 - **Exact-identifier — q011, q012.** Both queries are dominated by a CVE number ("What is CVE-2012-4681...", "What is CVE-2016-3715..."). Their `expected_technique_ids` are empty — these are CVE lookups, not technique lookups, so recall is measured against whether the right *CVE entry* came back, not a technique. A CVE ID is a near-opaque token: `all-MiniLM-L6-v2` embeds semantic meaning, and the ID carries almost none, so the query embedding lands in a generic "some vulnerability" region and the exact entry doesn't surface. With no technique vocabulary to fall back on, these are the cleanest possible illustration of dense retrieval failing on exact identifiers. *Fix: hybrid (dense + lexical/metadata-exact) retrieval — ADR candidate.*
 
 - **Multi-hop / compositional — q005, q016.** q005 expects three techniques (T1078, T1098, T1111 — defeat MFA, valid accounts, modify account settings); q016 expects a CVE plus T1210. A single query embedding averages across the clauses and matches none of them strongly enough to retrieve every required chunk in the top 3. The corpus has the answers; one embedding can't retrieve a
-multi-part answer. *Fix: query decomposition in the agentic routing layer*
+multi-part answer. *Fix: query decomposition — a separate operation from collection routing, which selects a corpus but does not split a multi-clause query into sub-queries.*
 
 - **Vocabulary mismatch — q008, q010.** The answers exist (T1041 Exfiltration Over C2 Channel; T1105 Ingress Tool Transfer) but the queries are written in plain English with zero MITRE vocabulary ("sneaking data out through the same connection they use to control their malware"). The chunks are written in technical terms; the embeddings don't bridge the gap. *Fix: query expansion or a reranker; partly an inherent embedding-model limit.*
 
@@ -102,11 +102,58 @@ multi-part answer. *Fix: query decomposition in the agentic routing layer*
 | q009 | Generation | Legitimate refusal (bad gold) | Eval-set revision |
 | q013 | Generation | Over-refusal (strict prompt) | Prompt loosening |
 | q015 | Mixed | Over-refusal + retrieval miss | Prompt + routing |
-| q005 | Retrieval | Multi-hop (T1078/T1098/T1111) | Routing (Wk 2) |
-| q016 | Retrieval | Multi-hop (CVE + T1210) | Routing (Wk 2) |
+| q005 | Retrieval | Multi-hop (T1078/T1098/T1111) | Query decomposition |
+| q016 | Retrieval | Multi-hop (CVE + T1210) | Query decomposition |
 | q008 | Retrieval | Vocabulary mismatch (T1041) | Query expansion / reranker |
 | q010 | Retrieval | Vocabulary mismatch (T1105) | Query expansion / reranker |
 | q011 | Retrieval | Exact-identifier (CVE, no technique) | Hybrid retrieval (ADR) |
 | q012 | Retrieval | Exact-identifier (CVE, no technique) | Hybrid retrieval (ADR) |
 
 No fixes are applied in this issue — it characterizes failures. Generation over-refusal and the judge blind spot inform the prompt and metric work; multi-hop and vocabulary-mismatch retrieval inform the routing layer; exact-identifier retrieval is the hybrid-retrieval ADR candidate.
+
+## Routing arm results
+
+The agentic routing layer was evaluated against the same K=3 harness and compared to the blind baseline. `use_routing=True` sends each query through `route_query`, which picks a corpus (`mitre_only`, `kev_only`, `both`, or `skip`); retrieval is then filtered to the routed corpus instead of querying the whole store.
+
+### Retrieval — routed vs blind
+
+| Metric | Blind baseline | Routed | Delta |
+|---|---|---|---|
+| Precision@3 | 0.2444 | 0.2444 | 0.0000 |
+| Recall@3 | 0.5667 | 0.5667 | 0.0000 |
+| n_misroutes | — | 0 | — |
+| Reconciliation | OK | OK (scored + gated == total) | — |
+
+**The result is flat, and that is the finding.** Routing changed neither precision nor recall at K=3, with zero misroutes. Read together, those two facts localize what routing does and does not do:
+
+- **Routing did its job.** `n_misroutes = 0` means every scored query reached the correct corpus — no query was sent to the wrong store or wrongly skipped. Corpus selection is correct.
+- **Correct corpus selection did not move top-3.** The store imbalance the routing layer was built to counter (540 MITRE chunks vs 1600 KEV) does distort deeper ranks — a MITRE query under `both` competes against 1600 KEV chunks — but for this eval set the correct chunks were *already ranking in the top 3 under blind retrieval*. Filtering out wrong-corpus chunks that sat at rank 4+ changed nothing about which three chunks won the top-3 slots. Routing removed noise that K=3 never saw.
+
+### Per-category breakdown
+
+| Corpus | Difficulty | Precision@3 | Recall@3 |
+|---|---|---|---|
+| cross | hard | 0.1667 | 0.2500 |
+| kev | easy | 0.0000 | 0.0000 |
+| kev | medium | 0.6667 | 1.0000 |
+| mitre | easy | 0.0000 | 0.0000 |
+| mitre | hard | 0.3333 | 0.7500 |
+| mitre | medium | 0.2667 | 0.8000 |
+
+The two `easy` buckets sit at 0.0000/0.0000 for both corpora — and with `n_misroutes = 0`, this is **not** a routing failure. These queries were correctly routed, hit the correct store, and the right chunks still did not come back in the top 3. That places the residual failure squarely at the retrieval layer, not the routing layer — the exact-identifier and vocabulary-mismatch modes already characterized in the baseline failure analysis (q008/q010/q011/q012). Routing cannot fix them because they were never routing problems.
+
+### What this run establishes
+
+Agentic routing held precision constant at K=3 while eliminating misroutes; the residual precision ceiling is a retrieval-layer problem, not a corpus-selection one. This is the measured evidence — not a prediction — behind the hybrid-retrieval ADR: routing is the right tool for corpus selection and the wrong tool for exact-identifier and vocab-mismatch lookup, and the data now shows exactly that separation. A flat precision delta with a clean misroute count is a stronger localization of the next bottleneck than a precision bump would have been.
+
+### Routed Faithfulness Results
+
+| Arm    | Faithfulness Mean | N Eligible | N Gated Out |
+|--------|-------------------|------------|-------------|
+| Blind  | 4.444              | 9          | 6           |
+| Routed | 5.000              | 9          | 6           |
+
+Delta: +0.556. Read with the standing caveat on this metric: faithfulness scores grounding, not correctness, and a refusal that makes no claims trivially passes. Two of the nine eligible rows this run (q013, q015) are refusals scored 5 for that reason — q015 is the same proof case already documented on the blind arm. Excluding both, 7/7 remaining rows scored 5 on genuinely grounded, substantive answers.
+
+**Reading the delta honestly:** with N=9 and 2 of those being refusal-inflated, this is not strong evidence that routing improved
+faithfulness — retrieval was flat (delta 0.0000) between arms, so there's no retrieval-side mechanism that would explain a real faithfulness gain. The safer read: faithfulness on the *retrieved-and-answered* subset is consistently high in both arms; the number the eval set is currently too small to separate "routing helped" from "sampling noise, judge blind spot." A correctness-vs-gold metric (fix-ordering: retrieval → correctness → prompt) would resolve this ambiguity — noted as future work.
