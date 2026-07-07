@@ -1,12 +1,4 @@
-import os
 from pathlib import Path
-from dotenv import load_dotenv
-
-
-load_dotenv(dotenv_path=Path(__file__).parent / ".env", override=True)
-
-GCP_PROJECT_ID = os.environ["GCP_PROJECT_ID"]
-GCP_LOCATION = os.environ.get("GCP_LOCATION", "us-central1")
 
 # ─── Data Paths ───────────────────────────────────────────────────────────────
 BASE_DIR = Path(__file__).parent
