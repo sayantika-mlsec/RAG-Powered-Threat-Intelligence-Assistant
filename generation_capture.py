@@ -22,6 +22,8 @@
 import argparse
 import json
 import logging
+import os
+import tempfile
 import time
 from pathlib import Path
 
@@ -102,13 +104,20 @@ def _load_existing(out_path: str) -> dict[str, dict]:
     """
     Load already-captured rows from a prior run of THIS arm, keyed by id.
     Only SUCCESSFUL rows are kept — failed rows are dropped so they get retried.
-    Returns {} if no prior artifact exists. Each arm has its own out_path, so
-    the two arms never contaminate each other's resume state.
+    Returns {} if no prior artifact exists, or if the file is corrupt (e.g. a
+    torn write from a hard crash) — treated the same as "nothing captured yet"
+    rather than crashing the whole script before a single row is attempted.
+    Each arm has its own out_path, so the two arms never contaminate each
+    other's resume state.
     """
     p = Path(out_path)
     if not p.exists():
         return {}
-    prior = json.loads(p.read_text(encoding="utf-8"))
+    try:
+        prior = json.loads(p.read_text(encoding="utf-8"))
+    except json.JSONDecodeError:
+        logger.warning(f"{out_path} is corrupt/unreadable — starting fresh for this arm.")
+        return {}
     kept = {
         r["id"]: r
         for r in prior.get("rows", [])
@@ -116,6 +125,31 @@ def _load_existing(out_path: str) -> dict[str, dict]:
     }
     logger.info(f"Found prior artifact: reusing {len(kept)} already-succeeded row(s).")
     return kept
+
+
+def _write_artifact(out_path: str, records_by_id: dict, use_routing: bool) -> None:
+    """
+    Persist current progress atomically. Writes to a temp file in the same
+    directory, then os.replace()'s it over out_path — os.replace is atomic on
+    both POSIX and Windows, so a crash mid-write can never leave a corrupt,
+    unparseable artifact for the next run's _load_existing to choke on.
+    Safe to call after every row.
+    """
+    artifact = {
+        "use_routing": use_routing,
+        "k_value": config.RETRIEVAL_TOP_K,
+        "row_count": len(records_by_id),
+        "rows": list(records_by_id.values()),
+    }
+    out_dir = Path(out_path).parent or Path(".")
+    fd, tmp_path = tempfile.mkstemp(dir=out_dir, suffix=".tmp")
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            json.dump(artifact, f, indent=2)
+        os.replace(tmp_path, out_path)  # atomic swap — old file or new file, never half of either
+    except Exception:
+        os.unlink(tmp_path)  # don't leave a stray .tmp lying around
+        raise
 
 
 def run_capture(eval_set_path: str, out_path: str, *, use_routing: bool) -> None:
@@ -126,70 +160,75 @@ def run_capture(eval_set_path: str, out_path: str, *, use_routing: bool) -> None
     reused as-is (no re-call). Only missing/failed rows hit the API, throttled to
     stay under the free-tier per-minute limit. Re-run freely until all rows green.
 
-    Fails loud if any row is missing a record, or ids collide, before writing.
+    Fails loud on duplicate ids BEFORE any API call. Checkpoints atomically after
+    every row, so a crash mid-run loses at most one row's spend, not the session.
     """
     eval_set = json.loads(Path(eval_set_path).read_text(encoding="utf-8"))
-    already = _load_existing(out_path)
 
-    records = []
+    # Fail loud BEFORE spending a single API call: records_by_id below is keyed
+    # by id, so a duplicate id would silently overwrite one row's captured
+    # answer with another's.
+    ids = [row["id"] for row in eval_set]
+    if len(set(ids)) != len(ids):
+        dupes = sorted({i for i in ids if ids.count(i) > 1})
+        raise RuntimeError(f"Duplicate ids in eval_set.json: {dupes}. Fix before running.")
+
+    records_by_id = _load_existing(out_path)  # {} or prior successful rows
     made_live_call = False
+
     for row in eval_set:
         row_id = row["id"]
 
-        # Reuse a prior successful capture — no API call, no throttle.
-        if row_id in already:
-            records.append(already[row_id])
+        if row_id in records_by_id:
             logger.info(f"Skipped {row_id} (already captured).")
             continue
 
-        # Throttle BEFORE each live call except the first, so spacing only
-        # applies between real API hits.
         if made_live_call:
             time.sleep(THROTTLE_SECONDS)
 
-        record = capture_row(row["query"], row_id, use_routing=use_routing)
+        # ISOLATE the failure: one bad row must not kill the whole run, and
+        # must not lose every row already captured this session.
+        try:
+            record = capture_row(row["query"], row_id, use_routing=use_routing)
+        except Exception as e:
+            logger.error(f"Row {row_id} raised {e!r} — recording as failed, continuing.")
+            record = {
+                "id": row_id,
+                "query": row["query"],
+                "generation_ok": False,
+                "mode": None,
+                "route": None,
+                "generated_answer": None,
+                "retrieved_context": [],
+                "citations": [],
+                "error": str(e),
+            }
+
         made_live_call = True
-        records.append(record)
+        records_by_id[row_id] = record
         logger.info(
-            f"Captured {row_id} "
-            f"(ok={record['generation_ok']}, route={record['route']}, mode={record['mode']})."
+            f"Captured {row_id} (ok={record['generation_ok']}, route={record['route']}, mode={record['mode']})."
         )
 
-    # Fail-loud BEFORE writing: every eval row must produce exactly one record.
-    # A count mismatch means a row was silently lost — a partial artifact would
-    # break the N + gated-out = total reconciliation downstream with no obvious
-    # cause.
-    if len(records) != len(eval_set):
-        raise RuntimeError(
-            f"Capture incomplete: {len(records)} records for {len(eval_set)} "
-            f"eval rows. Refusing to write a partial artifact."
-        )
+        # CHECKPOINT after every row. Worst case on a crash: you lose the one
+        # row in flight, not the whole session's spend.
+        _write_artifact(out_path, records_by_id, use_routing)
 
-    # Ids are the join key faithfulness uses against the recall artifact — a
-    # duplicate would silently overwrite when either side builds its lookup.
-    ids = [r["id"] for r in records]
-    if len(set(ids)) != len(ids):
-        raise RuntimeError("Duplicate ids in capture records — ids must be unique.")
+    # Final integrity check — checked against what's actually on disk/in memory.
+    missing = [row["id"] for row in eval_set if row["id"] not in records_by_id]
+    if missing:
+        raise RuntimeError(f"Capture incomplete: missing rows {missing}. Re-run to fill gaps.")
 
-    artifact = {
-        "use_routing": use_routing,          # which arm this artifact is
-        "k_value": config.RETRIEVAL_TOP_K,   # the true k retrieved with (=3, matches baseline)
-        "row_count": len(records),
-        "rows": records,
-    }
-
-    Path(out_path).write_text(json.dumps(artifact, indent=2), encoding="utf-8")
-
-    ok = sum(1 for r in records if r["generation_ok"])
-    skipped = sum(1 for r in records if r.get("route") == "skip")
+    ok = sum(1 for r in records_by_id.values() if r["generation_ok"])
+    skipped = sum(1 for r in records_by_id.values() if r.get("route") == "skip")
     logger.info(
-        f"Wrote {out_path}: {len(records)} rows "
-        f"({ok} generated, {len(records) - ok} failed, {skipped} skip-routed)."
+        f"Wrote {out_path}: {len(records_by_id)} rows "
+        f"({ok} generated, {len(records_by_id) - ok} failed, {skipped} skip-routed)."
     )
-    if ok < len(records):
-        still_failed = sorted(r["id"] for r in records if not r["generation_ok"])
+    if ok < len(records_by_id):
+        still_failed = sorted(rid for rid, r in records_by_id.items() if not r["generation_ok"])
         logger.warning(
-            f"{len(records) - ok} row(s) still failed: {still_failed}. "
+            f"{len(records_by_id) - ok} row(s) still failed: {still_failed}. "
             f"Re-run to retry only these (succeeded rows are reused)."
         )
 
