@@ -146,4 +146,14 @@ The two `easy` buckets sit at 0.0000/0.0000 for both corpora — and with `n_mis
 
 Agentic routing held precision constant at K=3 while eliminating misroutes; the residual precision ceiling is a retrieval-layer problem, not a corpus-selection one. This is the measured evidence — not a prediction — behind the hybrid-retrieval ADR: routing is the right tool for corpus selection and the wrong tool for exact-identifier and vocab-mismatch lookup, and the data now shows exactly that separation. A flat precision delta with a clean misroute count is a stronger localization of the next bottleneck than a precision bump would have been.
 
-> **Faithfulness (routed arm): pending.** The routed retrieval run above is only the precision half of the A/B. Routed faithfulness has not yet been scored, and precision-flat says nothing about whether routing changed answer grounding — that is a separate distribution. Before scoring, `RECALL_BASELINE_RUN_ID` must be repointed at *this* routed retrieval run's id, or routed answers get gated against blind eligibility. Routed faithfulness numbers and any routed row in the baseline table are deliberately omitted until that run lands.
+### Routed Faithfulness Results
+
+| Arm    | Faithfulness Mean | N Eligible | N Gated Out |
+|--------|-------------------|------------|-------------|
+| Blind  | 4.444              | 9          | 6           |
+| Routed | 5.000              | 9          | 6           |
+
+Delta: +0.556. Read with the standing caveat on this metric: faithfulness scores grounding, not correctness, and a refusal that makes no claims trivially passes. Two of the nine eligible rows this run (q013, q015) are refusals scored 5 for that reason — q015 is the same proof case already documented on the blind arm. Excluding both, 7/7 remaining rows scored 5 on genuinely grounded, substantive answers.
+
+**Reading the delta honestly:** with N=9 and 2 of those being refusal-inflated, this is not strong evidence that routing improved
+faithfulness — retrieval was flat (delta 0.0000) between arms, so there's no retrieval-side mechanism that would explain a real faithfulness gain. The safer read: faithfulness on the *retrieved-and-answered* subset is consistently high in both arms; the number the eval set is currently too small to separate "routing helped" from "sampling noise, judge blind spot." A correctness-vs-gold metric (fix-ordering: retrieval → correctness → prompt) would resolve this ambiguity — noted as future work.
