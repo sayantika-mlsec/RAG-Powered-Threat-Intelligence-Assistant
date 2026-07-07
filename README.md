@@ -8,18 +8,25 @@ Ask natural-language questions about attack techniques and known exploited vulne
 
 ## Architecture
 
-Query → Agentic Router (Gemini function-calling)
-│
-├── routes to MITRE ATT&CK collection
-├── routes to CISA KEV collection
-├── routes to both
-└── skip retrieval (greetings, meta-queries)
-│
-▼
-Retrieved context (ChromaDB, all-MiniLM-L6-v2 embeddings)
-│
-▼
-Gemini 2.5 Flash generation → response + source citations
+## Architecture
+
+```mermaid
+flowchart TD
+    A[Query] --> B[Agentic Router<br/>Gemini function-calling]
+    B --> C[MITRE ATT&CK collection]
+    B --> D[CISA KEV collection]
+    B --> E[Both collections]
+    B --> F[Skip retrieval<br/>greetings, meta-queries]
+    C --> G[Retrieved context<br/>ChromaDB, all-MiniLM-L6-v2]
+    D --> G
+    E --> G
+    G --> H[Gemini 2.5 Flash generation]
+    F --> H
+    H --> I[Response + source citations]
+```
+
+Routing exists because blind retrieval (always querying both corpora) wastes
+a retrieval pass on the wrong corpus for corpus-specific queries...
 
 Routing exists because blind retrieval (always querying both corpora) wastes a retrieval pass on the wrong corpus for corpus-specific queries, and risks citing irrelevant chunks on queries that need no retrieval at all. Full reasoning for this design choice — including why it's kept despite a flat precision delta in evaluation — is in [`docs/adr/001-agentic-routing.md`](./docs/adr/001-agentic-routing.md).
 
@@ -60,7 +67,7 @@ layer, not routing — exact-identifier lookup failures and vocabulary-mismatch 
 
 ```bash
 git clone https://github.com/sayantika-mlsec/RAG-Powered-Threat-Intelligence-Assistant.git
-cd RAG-Powered_Threat-Intelligence-Assistant
+cd RAG-Powered-Threat-Intelligence-Assistant
 pip install -r requirements.txt
 ```
 
@@ -73,8 +80,7 @@ python app.py
 ```
 
 ## Project structure
-
-.
+```
 ├── app.py                    # main query interface + routing
 ├── gemini_client.py          # shared Vertex AI client
 ├── generation_capture.py     # eval generation runs
@@ -88,3 +94,4 @@ python app.py
 │   └── adr/
 │       └── 001-agentic-routing.md
 └── requirements.txt
+```
