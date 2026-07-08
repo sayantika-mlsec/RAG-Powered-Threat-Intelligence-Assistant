@@ -24,6 +24,7 @@ import logging
 import gradio as gr
 from pathlib import Path
 from dotenv import load_dotenv
+import tempfile
 
 # Load .env BEFORE any of the project's own modules are imported. Several of
 # them (gemini_client.py, threat_analyzer.py, and transitively config.py)
@@ -32,6 +33,24 @@ from dotenv import load_dotenv
 # loading it here, first, makes app.py self-contained regardless of internal
 # ordering inside the modules it imports.
 load_dotenv(dotenv_path=Path(__file__).parent / ".env", override=False)
+
+# ── HF Spaces credential bootstrap ───────────────────────────────────────────
+# Locally, Vertex resolves credentials via ADC (gcloud auth). HF Spaces has no
+# gcloud session — credentials arrive as a JSON string in the
+# GOOGLE_APPLICATION_CREDENTIALS_JSON secret instead. Vertex's auth library
+# only reads a file path, so write the string to a temp file and point the
+# standard env var at it. Must precede get_client() — called inside
+# _initialize_systems() / _initialize_router_client() below — hence its place
+# immediately after load_dotenv().
+def _bootstrap_gcp_credentials() -> None:
+    creds_json = os.environ.get("GOOGLE_APPLICATION_CREDENTIALS_JSON")
+    if not creds_json:
+        return  # local dev — ADC handles it
+    with tempfile.NamedTemporaryFile(mode="w", suffix=".json", delete=False) as f:
+        f.write(creds_json)
+        os.environ["GOOGLE_APPLICATION_CREDENTIALS"] = f.name
+
+_bootstrap_gcp_credentials()
 
 from google import genai
 from google.genai import types
