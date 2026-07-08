@@ -159,22 +159,22 @@ Delta: +0.556. Read with the standing caveat on this metric: faithfulness scores
 faithfulness — retrieval was flat (delta 0.0000) between arms, so there's no retrieval-side mechanism that would explain a real faithfulness gain. The safer read: faithfulness on the *retrieved-and-answered* subset is consistently high in both arms; the number the eval set is currently too small to separate "routing helped" from "sampling noise, judge blind spot." A correctness-vs-gold metric (fix-ordering: retrieval → correctness → prompt) would resolve this ambiguity — noted as future work.
 
 ## Routing Stress Test
-
-The original 20-query eval set showed 0 misroutes, but wasn't designed to stress the router — it didn't contain deliberately ambiguous or cross-corpus phrasing. Ran 8 additional queries specifically targeting: cross-corpus bridging with no explicit IDs, bare identifiers (sanity check), the skip path, and vocabulary-mismatch phrasing.
-
+ 
+The original 20-query eval set showed 0 misroutes, but wasn't designed to stress the router — it didn't contain deliberately ambiguous or cross-corpus phrasing. Ran 8 additional queries (`scripts/stress_test_routes.py`, reproducible) specifically targeting: cross-corpus bridging with no explicit IDs, bare identifiers (sanity check), the skip path, and vocabulary-mismatch phrasing. Expected values match the `Route` enum's `.value` strings; q025 accepts either of two routes (pipe-separated) because it is ambiguous by design.
+ 
 | Query ID | Query | Expected Route | Actual Route | Misroute? |
 |---|---|---|---|---|
 | q021 | What technique does Log4Shell map to, and is it actively exploited? | both | both | no |
 | q022 | Which actively exploited vulnerabilities involve lateral movement? | both | both | no |
 | q023 | Is the MOVEit vulnerability linked to a known credential access technique? | both | both | no |
-| q024 | How do attackers get in through unpatched internet-facing software? | (ambiguous) | mitre_only | — |
-| q025 | Tell me about ransomware. | (ambiguous) | skip | — |
-| q026 | T1190 | mitre | mitre_only | no |
-| q027 | CVE-2021-34473 | kev | kev_only | no |
+| q024 | How do attackers get in through unpatched internet-facing software? | kev_only | mitre_only | yes |
+| q025 | Tell me about ransomware. | skip\|both | skip | no |
+| q026 | T1190 | mitre_only | mitre_only | no |
+| q027 | CVE-2021-34473 | kev_only | kev_only | no |
 | q028 | What did we just talk about? | skip | skip | no |
-
-**Result: 0 misroutes on the 6 unambiguous queries**, including all three deliberately cross-corpus ones (q021–q023). The router correctly bridged CVE-name-to-technique and concept-to-both-corpora reasoning with no explicit IDs in the query text — a harder case than anything in the original 20-query set, and it held.
-
-**q024 reproduces the known vocabulary-mismatch failure mode at the routing layer, not just retrieval.** The query describes a KEV-style concept (exploiting unpatched internet-facing software) but was routed MITRE-only, because the phrasing ("attackers get in") pattern-matched ATT&CK-style language. This suggests the vocabulary-mismatch problem documented in retrieval (q008/q010) is systemic to how the corpora are described and labeled, not isolated to the retrieval layer.
-
-**q025 routed to skip**, judging "tell me about ransomware" too broad to answer from either corpus. Defensible and conservative, but arguably "both" would have surfaced useful general context — a design tradeoff worth naming,not a bug.
+ 
+**Result: 0 misroutes on the 6 clean cases (q021–q023, q026–q028)**, including all three deliberately cross-corpus ones. The router correctly bridged CVE-name-to-technique and concept-to-both-corpora reasoning with no explicit IDs in the query text — a harder case than anything in the original 20-query set, and it held.
+ 
+**q024 is the one recorded misroute, and it reproduces the known vocabulary-mismatch failure mode at the routing layer, not just retrieval.** The query describes a KEV-style concept (exploiting unpatched internet-facing software) but was routed MITRE-only, because the phrasing ("attackers get in") pattern-matched ATT&CK-style language. This suggests the vocabulary-mismatch problem documented in retrieval (q008/q010) is systemic to how the corpora are described and labeled, not isolated to the retrieval layer.
+ 
+**q025 routed to skip**, judging "tell me about ransomware" too broad to answer from either corpus. Both `skip` and `both` are accepted as correct for this row: skip is the defensible conservative call, though arguably `both` would have surfaced useful general context — a design tradeoff worth naming, not a bug.
