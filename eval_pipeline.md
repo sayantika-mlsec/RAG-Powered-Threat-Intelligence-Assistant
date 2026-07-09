@@ -17,18 +17,18 @@ These are deliberately separate. Retrieval can succeed while generation hallucin
 
 The eval set is 20 queries (`eval_set.json`), each with a stable `id` (`q001`–`q020`) used as the join key across every artifact in the pipeline. Each row carries the query, `expected_technique_ids` (the MITRE techniques that should be retrieved — empty for pure CVE-lookup rows, which are scored against the correct CVE entry instead), and a manually written gold-answer summary.
 
-Gold answers are written **by hand, not AI-generated.** This is the load-bearing decision of the whole pipeline: an AI-generated gold answer is just another model output, so scoring against it measures agreement between two models, not correctness Hand-written gold answers — verified against the actually-ingested chunks — are the only real ground truth available. (As the failure analysis shows, even hand-written golds can encode assumptions the system's prompt forbids — see q009 — which is itself a finding, not a flaw in the approach.)
+Gold answers are written **by hand** This is the load-bearing decision of the whole pipeline: an AI-generated gold answer is just another model output, so scoring against it measures agreement between two models, not correctness. Hand-written gold answers — verified against the actually-ingested chunks — are the only real ground truth available. (As the failure analysis shows, even hand-written golds can encode assumptions the system's prompt forbids — see q009 — which is itself a finding, not a flaw in the approach.)
 
-The 20 rows split into a 15-row Group A (the reconciliation total used throughout) plus rows reserved for later expansion. Thin technique categories and new queries (`q021+`) are grown alongside the routing work.
+The 20 rows split into a 15-row Group A (the reconciliation total used throughout) plus 5 rows with no expected IDs (q014, q017–q020) — skip-path and no-retrieval probes, not scored against retrieval — which are never retrieval-scored and appear in the artifacts as `n_gated_out`. Thin technique categories and new queries (`q021+`) are grown alongside the routing work.
 
 ## Retrieval metrics — precision@K and recall@K
 
 **Precision@K** asks: of the K chunks retrieved, how many were relevant?
 **Recall@K** asks: of all the relevant chunks that exist, how many did we get in the top K? Both are measured at **K=3** against `expected_technique_ids`.
 
-Recall is the metric that gates the rest of the pipeline. A row with recall@3 = 0 — the right chunk never came back - is**ineligible for faithfulness scoring**, because faithfulness measures answer-vs-retrieved-context, and if retrieval failed there is no correct context to be faithful to. Scoring those rows would measure the generator's behaviour on garbage input, which is a different question. They are gated out, counted, and analysed separately (see failure analysis).
+Recall is the metric that gates the rest of the pipeline. A row with recall@3 = 0 — the right chunk never came back - is**ineligible for faithfulness scoring**, because faithfulness measures answer-vs-retrieved-context, and if retrieval failed there is no correct context to be faithful to. Scoring those rows would measure the generator's behaviour on garbage input, which is a different question. They are faithfulness-ineligible, counted, and analysed separately (see failure analysis). Note: this is distinct from the retrieval artifact's `n_gated_out` field, which counts rows with no expected IDs that are never retrieval-scored at all.
 
-Per-row recall is emitted as an MLflow artifact with fail-loud invariants: a K-pin guard (the K used must match the K claimed), a corpus stamp (chunk count recorded so a silently-changed corpus is detectable), and a reconciliation check. The eligibility decision for every downstream stage is *read from this artifact by run id*, never recomputed — so faithfulness is provably tied to the exact retrieval run that produced eligibility.
+Per-row recall is emitted as an MLflow artifact with fail-loud invariants: a K-pin guard (the K used must match the K claimed), a corpus stamp (chunk count recorded, catching partial/duplicate ingest; content edits at constant count are not detected — corpus version is guaranteed by run lineage), and a reconciliation check. The eligibility decision for every downstream stage is *read from this artifact by run id*, never recomputed — so faithfulness is provably tied to the exact retrieval run that produced eligibility.
 
 ## Faithfulness metric — LLM-as-judge
 
@@ -42,7 +42,7 @@ Faithfulness asks one question: do the generated answer's claims appear in the r
 
 ## Logging contract
 
-The faithfulness score is **never logged bare.** It travels with N (eligible row count), the gated-out count, and `recall_run_id` lineage, in a single MLflow run. Reconciliation (`N_eligible + gated_out == 15`) runs *before* any scoring — if the artifacts disagree about the eval set, the run stops rather than scoring against an inconsistent denominator. The empty-eligible case (N=0) logs null rather than dividing by zero. Bad judge output raises rather than coercing to a middle value.
+The faithfulness score is **never logged bare.** It travels with N (eligible row count), the gated-out count, and `recall_run_id` lineage, in a single MLflow run. Reconciliation (`N_eligible + N_ineligible == 15` — 9 + 6, within the scored set) runs *before* any scoring — if the artifacts disagree about the eval set, the run stops rather than scoring against an inconsistent denominator. The empty-eligible case (N=0) logs null rather than dividing by zero. Bad judge output raises rather than coercing to a middle value.
 
 ## Baseline numbers (single-pass RAG)
 
@@ -51,7 +51,7 @@ The faithfulness score is **never logged bare.** It travels with N (eligible row
 | Precision@3 | 0.2444 |
 | Recall@3 | 0.5667 |
 | Faithfulness mean | 4.444 (N=9 eligible) |
-| Gated out (recall@3 = 0) | 6 |
+| Faithfulness-ineligible (recall@3 = 0) | 6 |
 | Group A total | 15 (reconciles: 9 + 6) |
 | Corpus | chunk_count = 2140 |
 
@@ -82,7 +82,7 @@ The through-line: **strict no-prior-knowledge grounding trades recall for faithf
 The faithfulness judge is mechanically sound but has a structural blind spot, and q015 is the proof. An answer that makes no claims trivially passes a grounding check — there is nothing to contradict the context — so the judge scores refusals high regardless of whether the refusal was correct. It scored q009 and q015 a faithful 5, and caught q013's wrongful refusal only because it happened to reason "contradicts" rather than "no claims." On q015 the judge even reasoned the context was *thin* when the CVE chunk was in fact present — wrong about the context, yet a defensible score, because under the rubric a no-claims answer
 passes either way.
 
-This is not a judge bug to fix. It is an inherent property of grounding-only scoring: **faithfulness penalizes hallucination but is blind to under-answering. A model that refuses everything scores near-perfect faithfulness.** This is the concrete rows-behind-it evidence that faithfulness ≠ correctness, and the reason a separate correctness-against-gold metric is necessary (deferred, but now justified by data rather than assertion).
+This is not a judge bug to fix. It is an inherent property of grounding-only scoring: **faithfulness penalizes hallucination but is blind to under-answering. A model that refuses everything scores near-perfect faithfulness.** This is the concrete rows-behind-it evidence that faithfulness ≠ correctness, and the reason a separate correctness-against-gold metric is necessary (deferred, but now justified by data rather than assertion). (The routed run later confirmed this: the same q013 refusal scored 5 — see Routing arm results.)
 
 ### Retrieval failures (ineligible rows — recall@3 = 0)
 
@@ -127,7 +127,7 @@ The agentic routing layer was evaluated against the same K=3 harness and compare
 **The result is flat, and that is the finding.** Routing changed neither precision nor recall at K=3, with zero misroutes. Read together, those two facts localize what routing does and does not do:
 
 - **Routing did its job.** `n_misroutes = 0` means every scored query reached the correct corpus — no query was sent to the wrong store or wrongly skipped. Corpus selection is correct.
-- **Correct corpus selection did not move top-3.** The store imbalance the routing layer was built to counter (540 MITRE chunks vs 1600 KEV) does distort deeper ranks — a MITRE query under `both` competes against 1600 KEV chunks — but for this eval set the correct chunks were *already ranking in the top 3 under blind retrieval*. Filtering out wrong-corpus chunks that sat at rank 4+ changed nothing about which three chunks won the top-3 slots. Routing removed noise that K=3 never saw.
+- **Correct corpus selection did not move top-3.** The store imbalance the routing layer was built to counter (540 MITRE chunks vs 1600 KEV; per-corpus counts are not currently stamped in the artifact — only the combined 2140; per-corpus stamping is a scheduled fix) does distort deeper ranks — a MITRE query under `both` competes against 1600 KEV chunks — but for this eval set, recall was identical row-by-row between arms — consistent with the correct chunks already ranking in the top 3 under blind retrieval. (The per-row artifact does not yet store `retrieved_ids`, so top-3 identity is inferred from recall parity, not demonstrated chunk-by-chunk; adding `retrieved_ids` is a scheduled artifact upgrade.) Filtering out wrong-corpus chunks that sat at rank 4+ changed nothing about which three chunks won the top-3 slots. Routing removed noise that K=3 never saw.
 
 ### Per-category breakdown
 
@@ -144,23 +144,25 @@ The two `easy` buckets sit at 0.0000/0.0000 for both corpora — and with `n_mis
 
 ### What this run establishes
 
-Agentic routing held precision constant at K=3 while eliminating misroutes; the residual precision ceiling is a retrieval-layer problem, not a corpus-selection one. This is the measured evidence — not a prediction — behind the hybrid-retrieval ADR: routing is the right tool for corpus selection and the wrong tool for exact-identifier and vocab-mismatch lookup, and the data now shows exactly that separation. A flat precision delta with a clean misroute count is a stronger localization of the next bottleneck than a precision bump would have been.
+Agentic routing held precision constant at K=3 with zero misroutes; the residual precision ceiling is a retrieval-layer problem, not a corpus-selection one. This is the measured evidence — not a prediction — behind the hybrid-retrieval ADR: routing is the right tool for corpus selection and the wrong tool for exact-identifier and vocab-mismatch lookup, and the data now shows exactly that separation. A flat precision delta with a clean misroute count is a stronger localization of the next bottleneck than a precision bump would have been.
 
 ### Routed Faithfulness Results
 
-| Arm    | Faithfulness Mean | N Eligible | N Gated Out |
-|--------|-------------------|------------|-------------|
-| Blind  | 4.444              | 9          | 6           |
-| Routed | 5.000              | 9          | 6           |
+| Arm    | Faithfulness Mean | N Eligible | N Ineligible |
+|--------|-------------------|------------|--------------|
+| Blind  | 4.444              | 9          | 6            |
+| Routed | 5.000              | 9          | 6            |
+
+The delta decomposes exactly: sums of 40 vs 45 over the same 9 rows. q013 — the wrongful refusal the blind-arm judge scored 1 ("contradicts context") — scored 5 on this run ("no claims to contradict"): +4 of the 5 points from one row, on identical retrieval and identical refusal behavior. The remaining +1 is a single row moving 4→5. The delta is judge variance concentrated on ~2 rows, not a system change — and the q013 flip is direct confirmation of the blind-arm prediction that the judge caught q013 "only because it happened to reason 'contradicts.'"
 
 Delta: +0.556. Read with the standing caveat on this metric: faithfulness scores grounding, not correctness, and a refusal that makes no claims trivially passes. Two of the nine eligible rows this run (q013, q015) are refusals scored 5 for that reason — q015 is the same proof case already documented on the blind arm. Excluding both, 7/7 remaining rows scored 5 on genuinely grounded, substantive answers.
 
 **Reading the delta honestly:** with N=9 and 2 of those being refusal-inflated, this is not strong evidence that routing improved
-faithfulness — retrieval was flat (delta 0.0000) between arms, so there's no retrieval-side mechanism that would explain a real faithfulness gain. The safer read: faithfulness on the *retrieved-and-answered* subset is consistently high in both arms; the number the eval set is currently too small to separate "routing helped" from "sampling noise, judge blind spot." A correctness-vs-gold metric (fix-ordering: retrieval → correctness → prompt) would resolve this ambiguity — noted as future work.
+faithfulness — retrieval was flat (delta 0.0000) between arms, so there's no retrieval-side mechanism that would explain a real faithfulness gain. The safer read: faithfulness on the *retrieved-and-answered* subset is consistently high in both arms; the delta itself is judge-scoring variance concentrated on refusal rows, not a routing-driven improvement (see decomposition above). A correctness-vs-gold metric (fix-ordering: retrieval → correctness → prompt) would resolve this ambiguity — noted as future work.
 
 ## Routing Stress Test
  
-The original 20-query eval set showed 0 misroutes, but wasn't designed to stress the router — it didn't contain deliberately ambiguous or cross-corpus phrasing. Ran 8 additional queries (`scripts/stress_test_routes.py`, reproducible) specifically targeting: cross-corpus bridging with no explicit IDs, bare identifiers (sanity check), the skip path, and vocabulary-mismatch phrasing. Expected values match the `Route` enum's `.value` strings; q025 accepts either of two routes (pipe-separated) because it is ambiguous by design.
+The original 20-query eval set showed 0 misroutes, but wasn't designed to stress the router — it didn't contain deliberately ambiguous or cross-corpus phrasing. Ran 8 additional queries (`stress_test_routes.py`) specifically targeting: cross-corpus bridging with no explicit IDs, bare identifiers (sanity check), the skip path, and vocabulary-mismatch phrasing. These 8 queries probe routing decisions only — they were not retrieval-scored, so they have no recall numbers and do not affect the metrics above. Expected values match the `Route` enum's `.value` strings; q025 accepts either of two routes (pipe-separated) because it is ambiguous by design.
  
 | Query ID | Query | Expected Route | Actual Route | Misroute? |
 |---|---|---|---|---|
