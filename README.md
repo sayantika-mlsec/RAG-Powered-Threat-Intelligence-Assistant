@@ -8,8 +8,6 @@ Ask natural-language questions about attack techniques and known exploited vulne
 
 ## Architecture
 
-## Architecture
-
 ```mermaid
 flowchart TD
     A[Query] --> B[Agentic Router<br/>Gemini function-calling]
@@ -78,6 +76,7 @@ Requires a GCP project with Vertex AI enabled and application default credential
 ```bash
 python app.py
 ```
+Or query the deployed instance: [live demo](https://huggingface.co/spaces/sayantika-mlsec/RAG-Powered-Threat-Intel-Assistant)
 
 ## Project structure
 ```
@@ -95,3 +94,6 @@ python app.py
 │       └── 001-agentic-routing.md
 └── requirements.txt
 ```
+
+## Known Gaps
+- `EXAMPLE_QUERIES` in the deployed HF Space is ahead of this repo's `app.py` — sync pending.
