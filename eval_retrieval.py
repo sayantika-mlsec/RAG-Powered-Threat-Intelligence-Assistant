@@ -20,6 +20,7 @@ load_dotenv(dotenv_path=Path(__file__).parent / ".env", override=True)
 
 from ingest import ThreatIntelDB
 from routing import route_query, Route
+from retrieval_pipeline import retrieve_for_route
 
 import config
 
@@ -36,8 +37,9 @@ logger = logging.getLogger(__name__)
 # faithfulness gate expects if K matches this pin. Real if/raise, NOT assert.
 PINNED_BASELINE_K = 3
 
-# Throttle between routing API calls (routed arm only). Blind arm makes NO API
-# calls — semantic_search is local ChromaDB — so it never throttles.
+# Throttle between ANY live Gemini call — routing AND rewrite-fallback calls
+# both share this. Blind arm makes NO API calls — semantic_search is local
+# ChromaDB — so it never throttles.
 THROTTLE_SECONDS = 6
 
 
@@ -62,18 +64,37 @@ def run_evaluation(
     K: int = config.RETRIEVAL_TOP_K,
     *,
     use_routing: bool = False,
+    use_retrieval_fixes: bool = False,
     router_client=None,
 ):
     """
     Evaluate the RAG retrieval with Precision@K and Recall@K, emit a per-row
     metrics artifact (recall@K + eligibility + route) to the active MLflow run.
 
-    use_routing is the ONLY A/B variable:
-        False -> blind baseline: whole-store semantic_search (reproduces
-                 precision 0.2444 / recall 0.5667). No API calls, no throttle.
-        True  -> agentic: route_query decides the corpus, retrieval is filtered
-                 to it. A scored row wrongly routed to skip retrieves NOTHING
-                 (recall 0) — the misroute is penalised, not hidden.
+    TWO INDEPENDENT AXES — not one "ONLY A/B variable" as in the prior version:
+
+        use_routing         -> corpus selection. False = blind whole-store
+                                semantic_search (reproduces precision 0.2444 /
+                                recall 0.5667). True = agentic route_query
+                                decides the corpus, retrieval filtered to it.
+
+        use_retrieval_fixes -> exact-match ID lookup + corpus-tagged query
+                                rewrite + guaranteed-slot cross-corpus merge,
+                                applied WITHIN the routed arm's retrieval step.
+                                Requires use_routing=True — the fixes operate
+                                on route decisions and are meaningless without
+                                them.
+
+    Three valid arms:
+        blind:              use_routing=False, use_retrieval_fixes=False
+                             (unaffected by this issue's work — no API calls)
+        routed:              use_routing=True,  use_retrieval_fixes=False
+                             (existing agentic-routing baseline)
+        routed_with_fixes:   use_routing=True,  use_retrieval_fixes=True
+                             (this issue's exact-match/rewrite/merge fixes)
+
+    A scored row wrongly routed to skip retrieves NOTHING (recall 0) — the
+    misroute is penalised, not hidden, regardless of use_retrieval_fixes.
 
     Gating (route-based, three-way — restraint vs misroute vs normal):
         - gated-out = rows with NO expected IDs (nothing to retrieve; correct
@@ -96,6 +117,13 @@ def run_evaluation(
 
     if use_routing and router_client is None:
         raise ValueError("use_routing=True requires a router_client.")
+
+    if use_retrieval_fixes and not use_routing:
+        raise ValueError(
+            "use_retrieval_fixes=True requires use_routing=True — the fixes "
+            "(exact-match, rewrite, merge) operate on route decisions and "
+            "have no defined behavior against blind whole-store retrieval."
+        )
 
     # 1. Load the ground-truth dataset
     try:
@@ -146,7 +174,8 @@ def run_evaluation(
 
     logger.info(
         f"Evaluating {len(scored_queries)} scored queries at K={K} "
-        f"(use_routing={use_routing}, {len(gated_out)} gated out)..."
+        f"(use_routing={use_routing}, use_retrieval_fixes={use_retrieval_fixes}, "
+        f"{len(gated_out)} gated out)..."
     )
 
     global_precision_sum = 0.0
@@ -160,6 +189,15 @@ def run_evaluation(
 
     made_live_call = False
 
+    def _throttle():
+        """Guards ANY live Gemini call — routing AND rewrite-fallback calls
+        both funnel through this, so the gap is enforced regardless of which
+        call triggers it or how many happen per row."""
+        nonlocal made_live_call
+        if made_live_call:
+            time.sleep(THROTTLE_SECONDS)
+        made_live_call = True
+
     # 4. Core Evaluation Loop (scored rows only)
     for query_row in scored_queries:
         expected_ids = set(query_row['expected_technique_ids']) | set(query_row['expected_cve_ids'])
@@ -167,11 +205,8 @@ def run_evaluation(
         route_value = None
 
         if use_routing:
-            # Throttle before each routing call except the first.
-            if made_live_call:
-                time.sleep(THROTTLE_SECONDS)
+            _throttle()
             decision = route_query(query_row['query'], router_client)
-            made_live_call = True
             route_value = decision.route.value
 
             if decision.route == Route.SKIP:
@@ -184,13 +219,22 @@ def run_evaluation(
                 )
             else:
                 corpus = _route_to_corpus(decision.route)
-                results = db.semantic_search(query_row['query'], n_results=K, corpus=corpus)
+
+                if use_retrieval_fixes:
+                    results = retrieve_for_route(
+                        db, query_row['query'], router_client, K, corpus,
+                        throttle_fn=_throttle,
+                    )
+                else:
+                    results = db.semantic_search(query_row['query'], n_results=K, corpus=corpus)
+
                 if results.get("error"):
                     logger.error(f"Search failed: {query_row['query'][:40]}... {results['error']}")
                     continue
                 retrieved_ids = [m['technique_id'] for m in results['metadatas'][0]]
         else:
             # Blind baseline — whole store, no filter, no API call.
+            # UNCHANGED — never touches retrieve_for_route or use_retrieval_fixes.
             results = db.semantic_search(query_row['query'], n_results=K)
             if results.get("error"):
                 logger.error(f"Search failed: {query_row['query'][:40]}... {results['error']}")
@@ -211,6 +255,8 @@ def run_evaluation(
             f"recall_at_{K}": recall,
             "eligible": recall > 0,
             "route": route_value,   # None on the blind arm
+            "retrieved_ids": retrieved_ids,
+            "expected_ids": sorted(expected_ids),
         })
 
         cat = query_row.get('category', 'unknown')
@@ -228,7 +274,8 @@ def run_evaluation(
     recall_overall = global_recall_sum / global_count if global_count > 0 else 0.0
 
     # 5. Summary Report
-    print(f"\n--- Retrieval Evaluation Summary (K={K}, use_routing={use_routing}) ---")
+    print(f"\n--- Retrieval Evaluation Summary (K={K}, use_routing={use_routing}, "
+          f"use_retrieval_fixes={use_retrieval_fixes}) ---")
     print(f"{'Category':<15} | {'Difficulty':<10} | {'Precision@K':<12} | {'Recall@K'}")
     print("-" * 55)
     for (cat, diff), metrics in sorted(metrics_tracker.items()):
@@ -243,6 +290,19 @@ def run_evaluation(
     mlflow.log_metric("recall_overall", recall_overall)
     if use_routing:
         mlflow.log_metric("n_misroutes", len(misroute_ids))
+
+    # ── Per-row detail — printed directly, not just in the MLflow artifact,
+    # so a single run's mismatches are visible immediately without a
+    # separate pull/diff step. ──
+    print(f"\n{'Per-Row Detail':<8} | {'Recall':<7} | {'Retrieved':<40} | Expected")
+    print("-" * 100)
+    for r in per_row_records:
+        flag = "  " if r[f"recall_at_{K}"] > 0 else "!!"
+        print(
+            f"{flag} {r['id']:<6} | {r[f'recall_at_{K}']:<7.2f} | "
+            f"{str(r['retrieved_ids']):<40} | {r['expected_ids']}"
+        )
+    print("-" * 100)
 
     # ─── Reconciliation (fail-loud) & Artifact ───
     per_row_recall_sum = sum(r[f"recall_at_{K}"] for r in per_row_records)
@@ -262,6 +322,7 @@ def run_evaluation(
 
     artifact_payload = {
         "use_routing": use_routing,
+        "use_retrieval_fixes": use_retrieval_fixes,
         "corpus_stamp": {
             "collection_name": corpus_name,
             "chunk_count": corpus_size,
@@ -298,7 +359,13 @@ if __name__ == "__main__":
     ap = argparse.ArgumentParser()
     ap.add_argument("--use-routing", action="store_true",
                     help="agentic arm. Omit for the blind baseline.")
+    ap.add_argument("--use-retrieval-fixes", action="store_true",
+                    help="Requires --use-routing. Applies exact-match ID lookup "
+                         "+ corpus-tagged rewrite + guaranteed-slot merge.")
     args = ap.parse_args()
+
+    if args.use_retrieval_fixes and not args.use_routing:
+        ap.error("--use-retrieval-fixes requires --use-routing")
 
     client = None
     if args.use_routing:
@@ -309,17 +376,28 @@ if __name__ == "__main__":
         client = get_client()
 
     mlflow.set_experiment(config.MLFLOW_EXPERIMENT_NAME)
-    run_name = "retrieval_eval_routed" if args.use_routing else "retrieval_eval_blind"
+
+    if args.use_retrieval_fixes:
+        run_name = "retrieval_eval_routed_fixed"
+        arm_tag = "routed_with_fixes"
+    elif args.use_routing:
+        run_name = "retrieval_eval_routed"
+        arm_tag = "routed"
+    else:
+        run_name = "retrieval_eval_blind"
+        arm_tag = "blind"
+
     with mlflow.start_run(run_name=run_name):
-        mlflow.set_tag("arm", "routed" if args.use_routing else "blind")
+        mlflow.set_tag("arm", arm_tag)
 
         # ── Config params — make the run self-describing / reproducible ──
-        mlflow.log_param("use_routing",     args.use_routing)
-        mlflow.log_param("k",               config.RETRIEVAL_TOP_K)
-        mlflow.log_param("embedding_model", config.EMBEDDING_MODEL)
-        mlflow.log_param("chunk_size",      config.CHUNK_SIZE)
-        mlflow.log_param("chunk_overlap",   config.CHUNK_OVERLAP)
-        mlflow.log_param("max_chunk_chars", config.MAX_CHUNK_CHARS)
+        mlflow.log_param("use_routing",         args.use_routing)
+        mlflow.log_param("use_retrieval_fixes", args.use_retrieval_fixes)
+        mlflow.log_param("k",                   config.RETRIEVAL_TOP_K)
+        mlflow.log_param("embedding_model",     config.EMBEDDING_MODEL)
+        mlflow.log_param("chunk_size",          config.CHUNK_SIZE)
+        mlflow.log_param("chunk_overlap",       config.CHUNK_OVERLAP)
+        mlflow.log_param("max_chunk_chars",     config.MAX_CHUNK_CHARS)
         if args.use_routing:
             # Router model lives in routing.py (_ROUTER_MODEL), not config.
             from routing import _ROUTER_MODEL
@@ -328,5 +406,6 @@ if __name__ == "__main__":
         run_evaluation(
             str(config.EVAL_SET_PATH),
             use_routing=args.use_routing,
+            use_retrieval_fixes=args.use_retrieval_fixes,
             router_client=client,
         )
