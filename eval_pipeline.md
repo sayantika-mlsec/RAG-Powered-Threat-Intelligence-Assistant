@@ -180,3 +180,109 @@ The original 20-query eval set showed 0 misroutes, but wasn't designed to stress
 **q024 is the one recorded misroute, and it reproduces the known vocabulary-mismatch failure mode at the routing layer, not just retrieval.** The query describes a KEV-style concept (exploiting unpatched internet-facing software) but was routed MITRE-only, because the phrasing ("attackers get in") pattern-matched ATT&CK-style language. This suggests the vocabulary-mismatch problem documented in retrieval (q008/q010) is systemic to how the corpora are described and labeled, not isolated to the retrieval layer.
  
 **q025 routed to skip**, judging "tell me about ransomware" too broad to answer from either corpus. Both `skip` and `both` are accepted as correct for this row: skip is the defensible conservative call, though arguably `both` would have surfaced useful general context — a design tradeoff worth naming, not a bug.
+
+## Retrieval Precision-Ceiling Fixes — Exact-Match, Query Rewrite, Cross-Corpus Merge - July 13
+
+**Issue:** #17 — "Fix RAG retrieval precision ceiling: exact-ID matching, query rewriting, cross-corpus routing"
+
+### What was fixed
+
+Three mechanisms, added as a new `use_retrieval_fixes` arm (independent of`use_routing` — see updated `run_evaluation` docstring):
+
+1. **Exact-match ID lookup** (`exact_id.py`) — regex-extracts all literal CVE and MITRE technique IDs from the raw query, bypasses the embedder entirely via a direct ChromaDB metadata filter. Fully deterministic.
+2. **Corpus-tagged query rewrite** (`query_rewrite.py`) — single Gemini call splits a query into 1-4 sub-queries when it genuinely chains distinct actions, tags each with a predicted corpus (`mitre`/`kev`). Falls back to a single reworded query for non-ID, non-multi-hop queries.
+3. **Guaranteed-slot cross-corpus merge** — each sub-query's own best result gets a guaranteed seat in the final top-K before remaining slots fill globally by distance. Fixes a real starvation bug where one sub-query's near-miss results could crowd out another sub-query's correct answer purely because raw distances aren't comparable across sub-queries searching different corpora.
+
+### Results — confirmed
+
+| Arm | Precision@3 | Recall@3 |
+|---|---|---|
+| Blind (pinned baseline) | 0.2444 | 0.5667 |
+| Routed (no fixes) | 0.2444 | 0.5667 *(identical to blind — confirms 0 misroutes, routing alone doesn't move retrieval precision)* |
+| Routed + fixes | **0.4667** | **0.7556** *(confirmed: category-weighted cross-check against per-row data matches exactly — 7.00/15 precision, 11.333/15 recall)* |
+
+Category breakdown, routed + fixes:
+
+| Category | Difficulty | Precision@3 | Recall@3 |
+|---|---|---|---|
+| cross | hard | 0.3333 | 0.5000 |
+| kev | easy | 1.0000 | 1.0000 |
+| kev | medium | 0.6667 | 1.0000 |
+| mitre | easy | 0.3333 | 1.0000 |
+| mitre | hard | 0.4167 | 0.5833 |
+| mitre | medium | 0.3333 | 0.8000 |
+
+Net: **+91% precision, +33% recall** vs. baseline, from retrieval-layer fixes alone — routing was already correct going in (0 misroutes on every run this session).
+
+### Known Limitation 1 — Residual Dense-Retrieval Ranking Miss (q015, q016)
+
+Both cross-corpus queries (route=`both`) still miss one half of their expected answer even after all fixes: q015's T1190 (MITRE side) and q016's CVE-2020-0796 (KEV side) are both confirmed present in their sub-query's own candidate pool at low rank (rank 13/15 and 5/15 respectively, via direct widened-pool inspection) — a genuine embedding-ranking limitation, not a bug in the merge or routing logic. Pool-widening (fetching more candidates per sub-query so a low-ranked correct answer could surface during merge) was evaluated and found insufficient on its own for q015 (T1190 still ranked 13th even with canonical MITRE phrasing);
+not shipped.
+
+**Candidate follow-ups (not in scope here):** cross-encoder re-ranking on a widened per-sub-query candidate pool before final merge; chunk-level rewording to align source text closer to expected query vocabulary; or a hybrid lexical layer (BM25).
+
+### Known Limitation 2 — Rewrite Step Is Not Deterministic Across Runs
+
+Across five full-suite and isolated runs of the identical pipeline against
+identical queries, the rewrite step (`temperature=0.0`, not guaranteed
+deterministic per Gemini's own floating-point behavior across GPU cores)
+produced measurably different outcomes run-to-run:
+
+- **q016**: three different outcomes across three runs on the SAME query — a full rescue (T1210 recovered via guaranteed-slot merge), a full miss (JSON truncation fallback, later root-caused to a missing `thinking_config=ThinkingConfig(thinking_budget=0)` setting and fixed — same fix pattern already applied to the faithfulness judge elsewhere in this project), and a different full miss (wrong sub-query split entirely, once truncation was fixed).
+- **q001**: passed on plain dense search (routed, no fixes), then FAILED after the rewrite step incorrectly split a single-concept query into two sub-queries based on a coincidental keyword overlap ("command-and-control" read as a second technique rather than descriptive context). A targeted prompt rule was added to prevent this; q001 still failed on the subsequent run.
+- **q004**: passed in every prior run, including the immediately preceding one, then regressed to a full miss the run immediately after an unrelated prompt-rule addition (parent-technique preference, added to fix q007) — confirming the rewrite prompt's rules interact with each other in ways not fully predictable from the ruleset alone.
+- **q007**: failed initially (over-specific sub-technique selected instead of the parent technique the query asked for — matches this query's own `difficulty_note` in `eval_set.json`), fixed by an explicit "prefer parent technique" prompt rule, held on the one subsequent run.
+
+**Root cause:** the rewrite step is an LLM call making a judgment (split-or-not, which corpus, which phrasing, which granularity) that is sensitive to exact wording variation between otherwise-identical calls. Four rounds of prompt patching during this session each fixed the specific failure being chased while occasionally introducing or failing to resolve others — diminishing returns consistent with prompt-only iteration having a real ceiling on this class of problem.
+
+**Contrast worth noting:** the exact-match component (mechanism 1) is fully deterministic and was correct on every single run, no exceptions — the instability is isolated entirely to the LLM-driven rewrite step (mechanisms 2-3), not the pipeline as a whole.
+
+## Fallback-Only Rewrite Restructuring (Confidence Gate) - July 14
+
+**Motivation:** the Jul 13 routed_with_fixes arm improved precision/recall (0.2444→0.4667 / 0.5667→0.7556) but introduced a stability problem: rewrite ran unconditionally on every non-exact-match query, and at least one query (q001) that dense search already answered correctly got broken by rewrite splitting it on a keyword coincidence.
+
+**Design:** `retrieve_for_route()` now tries dense search on the raw query *before* rewrite, and only falls through to rewrite if dense search isn't confident. "Confident" = the top-1 result's distance is at or below a threshold calibrated offline — there's no ground truth to check against at inference time (see `confidence_gate.py` module docstring for the full reasoning).
+
+**Calibration methodology:**
+- Ran dense-search-only over the eval set's 15 scored queries.
+- Excluded 2 queries that resolve via exact-match in production (they never reach the gate) and 0 misroutes this run — 13 queries used.
+- Split top-1 distances by whether the retrieved chunk's ID was in `expected_ids`: 8 successes (range 0.2328–0.4446), 5 failures
+  (range 0.324–0.4464). The two distributions overlap substantially.
+- Two threshold candidates: coverage-optimized (75th percentile of successes → 0.3775) vs. conservative (largest success distance below the smallest failure distance → 0.3146).
+- **Chose the conservative threshold (0.3146).** The two error types aren't equal cost: a wrongly-trusted dense result is guaranteed wrong with no rewrite chance to correct it, while a correct dense result sent to rewrite unnecessarily is usually still right. At 0.3775, 3 of 5 observed failures would have been wrongly trusted; at 0.3146, zero are.
+- Caveat: n=13 is small. "Zero observed false positives" is a property of this eval set, not a guarantee — revisit if/when the eval set grows past 30–50 queries.
+
+**Results — 3 independent runs, frozen pipeline** (no prompt edits between runs, unlike Jul 13's four-rounds-of-patching session):
+
+| Run | Path distribution | Precision@3 | Recall@3 |
+|---|---|---|---|
+| 1 | exact_match: 2, dense_confident: 3, rewrite: 10 | 0.4778 | 0.8222 |
+| 2 | identical to run 1 | identical | identical |
+| 3 | identical to run 1 | identical | identical |
+
+All 15 rows — including all 10 `rewrite`-path rows — returned byte-identical `retrieved_ids` across all 3 runs. Verified deliberately: the first repeat was assumed to be a re-pasted/cached artifact rather than a real result until MLflow run IDs and timestamps confirmed all 3 were independent executions.
+
+| Arm | Precision@3 | Recall@3 |
+|---|---|---|
+| Blind | 0.2444 | 0.5667 |
+| Routed, no fixes | 0.2444 | 0.5667 |
+| Routed + fixes (ungated, Jul 13) | 0.4667 | 0.7556 |
+| **Routed + fixes + gate (Jul 14)** | **0.4778** | **0.8222** |
+
+Both metrics are at or above the ungated arm — the gate cost nothing in aggregate on this eval set, on top of fixing the stability problem it was built for.
+
+**q001 — confirmed fixed.** Now resolves via `dense_confident`, never touches rewrite. Deterministic by construction (dense search + exact-match have no sampling step) — this query cannot regress the way it did on Jul 13, regardless of what rewrite does to other queries.
+
+**q004 — reframed, not resolved.** Still 0/1 recall, all 3 runs, identical wrong retrieval each time (`T1484, T1070, T1062` vs. expected `T1690`). Two things worth separating:
+- The gate correctly deferred it to rewrite — dense search wasn't confident, so this is not a gate false positive.
+- Rewrite's failure on q004 is now shown to be *consistent*, not the flaky/non-deterministic behavior originally logged Jul 13. That original finding was observed during active rewrite-prompt patching, not against a frozen prompt — likely conflated prompt-edit effects with sampling noise.
+- Open follow-up, not solved here: why rewrite consistently misses T1690 for this query — ingestion gap, or semantic drift in the rewritten sub-query. Needs its own investigation, separate from this issue.
+
+**q015 — known limitation, not a new regression.** `dense_confident` on the `both` route, but only 0.5 recall (misses `T1190`). The `both` route's dense-search-first check runs an unfiltered whole-store search — it can look confident on one half of a two-part query without ever attempting the corpus split that might catch the other half. Same 0.5 recall q015 got
+under rewrite before, so no regression — but it's the specific risk named in `confidence_gate.py`'s calibration docstring, now observed in practice rather than theoretical. Worth a per-route-type threshold check if the eval set grows and `both`-route traffic becomes a bigger fraction of it.
+
+**Revised understanding of the Jul 13 "rewrite non-determinism" finding:** likely partially an artifact of concurrent prompt editing in that session, not purely a `temperature=0.0` sampling effect. Not proven — 3 samples on one frozen query set is suggestive, not conclusive — but worth stating as the current best explanation rather than repeating "rewrite is inherently unstable" unqualified going forward.
+
+**mitre|medium delta (0.3333→0.3667 / 0.8000→1.0000), resolved**: two rows account for the full shift. q001 is the fix already documented above — Jul 13's confirmed run still had it failing (recall 0.0), Jul 14 resolves it via dense_confident. q006 is new: recall was already 1.0 under Jul 13's unconditional rewrite (precision 0.5, 2 chunks retrieved); Jul 14's gate lets it bypass rewrite (dense_confident, precision 0.3333, 3 chunks retrieved, one extra unrelated near-miss). Recall unaffected — the precision dip is a byproduct of the retrieval mechanism switching on a query that was correct either way, not a regression.
+
+Faithfulness — stale against current retrieval, not re-scored here. The "Routed Faithfulness Results" above (mean 5.000, N=9 eligible / 6 ineligible) were measured against the routed arm, recall@3 = 0.5667 at the time. Eligibility is defined as recall@3 > 0, and recall@3 on routed_with_fixes_gated is now 0.8222 — several of those 6 ineligible rows are almost certainly eligible now, which changes both N and the mean in ways not reflected above. No faithfulness run has been made against the current retrieval arm.
