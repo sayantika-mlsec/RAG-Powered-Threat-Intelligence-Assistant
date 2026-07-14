@@ -18,3 +18,5 @@ MAX_QUERY_LENGTH = 2000
 
 # ─── MLflow Settings ──────────────────────────────────────────────────────────
 MLFLOW_EXPERIMENT_NAME = "Threat_Intel_RAG_Evaluation"
+
+RETRIEVAL_CONFIDENCE_THRESHOLD = 0.3146

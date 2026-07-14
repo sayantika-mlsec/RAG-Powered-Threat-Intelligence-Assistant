@@ -65,6 +65,7 @@ def run_evaluation(
     *,
     use_routing: bool = False,
     use_retrieval_fixes: bool = False,
+    use_confidence_gate: bool = False,
     router_client=None,
 ):
     """
@@ -85,13 +86,31 @@ def run_evaluation(
                                 on route decisions and are meaningless without
                                 them.
 
-    Three valid arms:
-        blind:              use_routing=False, use_retrieval_fixes=False
-                             (unaffected by this issue's work — no API calls)
-        routed:              use_routing=True,  use_retrieval_fixes=False
-                             (existing agentic-routing baseline)
-        routed_with_fixes:   use_routing=True,  use_retrieval_fixes=True
-                             (this issue's exact-match/rewrite/merge fixes)
+        use_confidence_gate -> fallback-only rewrite restructuring (Jul 14
+                                session). Within retrieve_for_route(), try
+                                dense search first; only fall through to the
+                                unstable rewrite step if the top-1 distance
+                                misses the calibrated confidence threshold.
+                                Requires use_retrieval_fixes=True — there's
+                                nothing to gate without the fixes arm's
+                                exact-match/rewrite retrieval path.
+
+    Four valid arms:
+        blind:                use_routing=False, use_retrieval_fixes=False
+                               (unaffected by this issue's work — no API calls)
+        routed:               use_routing=True,  use_retrieval_fixes=False
+                               (existing agentic-routing baseline)
+        routed_with_fixes:    use_routing=True,  use_retrieval_fixes=True,
+                               use_confidence_gate=False
+                               (exact-match/rewrite/merge fixes, rewrite runs
+                               unconditionally on every non-ID query)
+        routed_with_fixes_gated: use_routing=True, use_retrieval_fixes=True,
+                               use_confidence_gate=True
+                               (same fixes, rewrite only on low dense-search
+                               confidence — this is what's being A/B'd against
+                               routed_with_fixes to confirm q001/q004 stop
+                               regressing without losing q007/q015/q016's
+                               rewrite-rescues)
 
     A scored row wrongly routed to skip retrieves NOTHING (recall 0) — the
     misroute is penalised, not hidden, regardless of use_retrieval_fixes.
@@ -123,6 +142,14 @@ def run_evaluation(
             "use_retrieval_fixes=True requires use_routing=True — the fixes "
             "(exact-match, rewrite, merge) operate on route decisions and "
             "have no defined behavior against blind whole-store retrieval."
+        )
+
+    if use_confidence_gate and not use_retrieval_fixes:
+        raise ValueError(
+            "use_confidence_gate=True requires use_retrieval_fixes=True — "
+            "the gate decides whether retrieve_for_route() falls through to "
+            "rewrite; it has nothing to gate without the fixes arm's "
+            "retrieval path."
         )
 
     # 1. Load the ground-truth dataset
@@ -175,7 +202,7 @@ def run_evaluation(
     logger.info(
         f"Evaluating {len(scored_queries)} scored queries at K={K} "
         f"(use_routing={use_routing}, use_retrieval_fixes={use_retrieval_fixes}, "
-        f"{len(gated_out)} gated out)..."
+        f"use_confidence_gate={use_confidence_gate}, {len(gated_out)} gated out)..."
     )
 
     global_precision_sum = 0.0
@@ -203,6 +230,12 @@ def run_evaluation(
         expected_ids = set(query_row['expected_technique_ids']) | set(query_row['expected_cve_ids'])
 
         route_value = None
+        # None on: blind arm, plain-routed arm (no fixes), and any row this
+        # iteration doesn't reach a fixes/gate branch for. Set explicitly in
+        # each branch below rather than derived from `results` after the
+        # fact — `results` is NOT reassigned on the SKIP branch, so reading
+        # it there would silently reuse a stale value from a prior row.
+        retrieval_path = None
 
         if use_routing:
             _throttle()
@@ -213,6 +246,7 @@ def run_evaluation(
                 # Misroute: a real query (has expected IDs) wrongly skipped.
                 # Retrieval is empty → recall 0. Penalised, not hidden.
                 retrieved_ids = []
+                retrieval_path = "skip_misroute"
                 misroute_ids.append(query_row.get('id'))
                 logger.warning(
                     f"MISROUTE {query_row.get('id')}: scored query routed to skip."
@@ -224,6 +258,7 @@ def run_evaluation(
                     results = retrieve_for_route(
                         db, query_row['query'], router_client, K, corpus,
                         throttle_fn=_throttle,
+                        use_confidence_gate=use_confidence_gate,
                     )
                 else:
                     results = db.semantic_search(query_row['query'], n_results=K, corpus=corpus)
@@ -232,6 +267,12 @@ def run_evaluation(
                     logger.error(f"Search failed: {query_row['query'][:40]}... {results['error']}")
                     continue
                 retrieved_ids = [m['technique_id'] for m in results['metadatas'][0]]
+                if use_retrieval_fixes:
+                    # retrieve_for_route() must set results["path"] to one of
+                    # "exact_match" / "dense_confident" / "rewrite" for this
+                    # to be meaningful — see retrieval_pipeline.py dependency
+                    # note below.
+                    retrieval_path = results.get("path", "unknown")
         else:
             # Blind baseline — whole store, no filter, no API call.
             # UNCHANGED — never touches retrieve_for_route or use_retrieval_fixes.
@@ -255,6 +296,7 @@ def run_evaluation(
             f"recall_at_{K}": recall,
             "eligible": recall > 0,
             "route": route_value,   # None on the blind arm
+            "retrieval_path": retrieval_path,  # None unless use_retrieval_fixes
             "retrieved_ids": retrieved_ids,
             "expected_ids": sorted(expected_ids),
         })
@@ -291,6 +333,20 @@ def run_evaluation(
     if use_routing:
         mlflow.log_metric("n_misroutes", len(misroute_ids))
 
+    path_counts = {}
+    if use_retrieval_fixes:
+        path_counts = defaultdict(int)
+        for r in per_row_records:
+            path_counts[r["retrieval_path"] or "unknown"] += 1
+        path_counts = dict(path_counts)
+        for path_name, count in sorted(path_counts.items()):
+            mlflow.log_metric(f"n_path_{path_name}", count)
+        n_rewrite = path_counts.get("rewrite", 0)
+        logger.info(
+            f"Retrieval path distribution: {path_counts} "
+            f"({n_rewrite}/{len(per_row_records)} queries touched rewrite)"
+        )
+
     # ── Per-row detail — printed directly, not just in the MLflow artifact,
     # so a single run's mismatches are visible immediately without a
     # separate pull/diff step. ──
@@ -323,6 +379,8 @@ def run_evaluation(
     artifact_payload = {
         "use_routing": use_routing,
         "use_retrieval_fixes": use_retrieval_fixes,
+        "use_confidence_gate": use_confidence_gate,
+        "retrieval_path_counts": path_counts,
         "corpus_stamp": {
             "collection_name": corpus_name,
             "chunk_count": corpus_size,
@@ -362,10 +420,16 @@ if __name__ == "__main__":
     ap.add_argument("--use-retrieval-fixes", action="store_true",
                     help="Requires --use-routing. Applies exact-match ID lookup "
                          "+ corpus-tagged rewrite + guaranteed-slot merge.")
+    ap.add_argument("--use-confidence-gate", action="store_true",
+                    help="Requires --use-retrieval-fixes. Gates the rewrite "
+                         "fallback on dense-search top-1 confidence instead "
+                         "of always rewriting.")
     args = ap.parse_args()
 
     if args.use_retrieval_fixes and not args.use_routing:
         ap.error("--use-retrieval-fixes requires --use-routing")
+    if args.use_confidence_gate and not args.use_retrieval_fixes:
+        ap.error("--use-confidence-gate requires --use-retrieval-fixes")
 
     client = None
     if args.use_routing:
@@ -377,7 +441,10 @@ if __name__ == "__main__":
 
     mlflow.set_experiment(config.MLFLOW_EXPERIMENT_NAME)
 
-    if args.use_retrieval_fixes:
+    if args.use_confidence_gate:
+        run_name = "retrieval_eval_routed_fixed_gated"
+        arm_tag = "routed_with_fixes_gated"
+    elif args.use_retrieval_fixes:
         run_name = "retrieval_eval_routed_fixed"
         arm_tag = "routed_with_fixes"
     elif args.use_routing:
@@ -393,6 +460,11 @@ if __name__ == "__main__":
         # ── Config params — make the run self-describing / reproducible ──
         mlflow.log_param("use_routing",         args.use_routing)
         mlflow.log_param("use_retrieval_fixes", args.use_retrieval_fixes)
+        mlflow.log_param("use_confidence_gate", args.use_confidence_gate)
+        if args.use_confidence_gate:
+            # Reproducibility: the calibrated number this run's gate decisions
+            # actually used, not just the fact that gating was on.
+            mlflow.log_param("confidence_threshold", config.RETRIEVAL_CONFIDENCE_THRESHOLD)
         mlflow.log_param("k",                   config.RETRIEVAL_TOP_K)
         mlflow.log_param("embedding_model",     config.EMBEDDING_MODEL)
         mlflow.log_param("chunk_size",          config.CHUNK_SIZE)
@@ -407,5 +479,6 @@ if __name__ == "__main__":
             str(config.EVAL_SET_PATH),
             use_routing=args.use_routing,
             use_retrieval_fixes=args.use_retrieval_fixes,
+            use_confidence_gate=args.use_confidence_gate,
             router_client=client,
         )
