@@ -38,11 +38,11 @@ Faithfulness asks one question: do the generated answer's claims appear in the r
 
 **Judge implementation note.** The judge runs on the new `google.genai` SDK specifically to disable model thinking (`ThinkingConfig(thinking_budget=0)`): `gemini-2.5-flash` thinks by default, and the thinking tokens consumed the output budget and truncated the JSON reply. The old `google.generativeai` SDK has no `ThinkingConfig`, which forced the judge — and only the judge — onto the new SDK. Generation and ingest remain on the old SDK; the two coexist intentionally and transitionally. (This two-SDK decision is an ADR candidate.)
 
-**Known limitation.** The judge is structurally blind to wrongful refusal — an answer that makes no claims trivially passes the grounding check. This is detailed in the failure analysis with q015 as the proof case, and is the concrete reason a separate correctness-against-gold metric is necessary (deferred, but justified by data).
+**Known limitation.** The judge is structurally blind to wrongful refusal — an answer that makes no claims trivially passes the grounding check. This is detailed in the failure analysis with q015 as the proof case, and is the concrete reason a separate correctness-against-gold metric is necessary (deferred, but justified by data). As of the gated re-score (below), this limitation is now confirmed **bidirectional**: the judge is inconsistent in both directions on refusal-shaped answers, not just biased toward leniency.
 
 ## Logging contract
 
-The faithfulness score is **never logged bare.** It travels with N (eligible row count), the gated-out count, and `recall_run_id` lineage, in a single MLflow run. Reconciliation (`N_eligible + N_ineligible == 15` — 9 + 6, within the scored set) runs *before* any scoring — if the artifacts disagree about the eval set, the run stops rather than scoring against an inconsistent denominator. The empty-eligible case (N=0) logs null rather than dividing by zero. Bad judge output raises rather than coercing to a middle value.
+The faithfulness score is **never logged bare.** It travels with N (eligible row count), the gated-out count, and `recall_run_id` lineage, in a single MLflow run. Reconciliation (`N_eligible + N_ineligible == 15` — within the scored set) runs *before* any scoring — if the artifacts disagree about the eval set, the run stops rather than scoring against an inconsistent denominator. The empty-eligible case (N=0) logs null rather than dividing by zero. Bad judge output raises rather than coercing to a middle value.
 
 ## Baseline numbers (single-pass RAG)
 
@@ -82,7 +82,7 @@ The through-line: **strict no-prior-knowledge grounding trades recall for faithf
 The faithfulness judge is mechanically sound but has a structural blind spot, and q015 is the proof. An answer that makes no claims trivially passes a grounding check — there is nothing to contradict the context — so the judge scores refusals high regardless of whether the refusal was correct. It scored q009 and q015 a faithful 5, and caught q013's wrongful refusal only because it happened to reason "contradicts" rather than "no claims." On q015 the judge even reasoned the context was *thin* when the CVE chunk was in fact present — wrong about the context, yet a defensible score, because under the rubric a no-claims answer
 passes either way.
 
-This is not a judge bug to fix. It is an inherent property of grounding-only scoring: **faithfulness penalizes hallucination but is blind to under-answering. A model that refuses everything scores near-perfect faithfulness.** This is the concrete rows-behind-it evidence that faithfulness ≠ correctness, and the reason a separate correctness-against-gold metric is necessary (deferred, but now justified by data rather than assertion). (The routed run later confirmed this: the same q013 refusal scored 5 — see Routing arm results.)
+This is not a judge bug to fix. It is an inherent property of grounding-only scoring: **faithfulness penalizes hallucination but is blind to under-answering. A model that refuses everything scores near-perfect faithfulness.** This is the concrete rows-behind-it evidence that faithfulness ≠ correctness, and the reason a separate correctness-against-gold metric is necessary (deferred, but now justified by data rather than assertion). (The routed run later confirmed this: the same q013 refusal scored 5 — see Routing arm results. The gated re-score confirms it a second time, independently, and adds a mirror-image case — see Gated Faithfulness Re-Score below.)
 
 ### Retrieval failures (ineligible rows — recall@3 = 0)
 
@@ -285,4 +285,36 @@ under rewrite before, so no regression — but it's the specific risk named in `
 
 **mitre|medium delta (0.3333→0.3667 / 0.8000→1.0000), resolved**: two rows account for the full shift. q001 is the fix already documented above — Jul 13's confirmed run still had it failing (recall 0.0), Jul 14 resolves it via dense_confident. q006 is new: recall was already 1.0 under Jul 13's unconditional rewrite (precision 0.5, 2 chunks retrieved); Jul 14's gate lets it bypass rewrite (dense_confident, precision 0.3333, 3 chunks retrieved, one extra unrelated near-miss). Recall unaffected — the precision dip is a byproduct of the retrieval mechanism switching on a query that was correct either way, not a regression.
 
-Faithfulness — stale against current retrieval, not re-scored here. The "Routed Faithfulness Results" above (mean 5.000, N=9 eligible / 6 ineligible) were measured against the routed arm, recall@3 = 0.5667 at the time. Eligibility is defined as recall@3 > 0, and recall@3 on routed_with_fixes_gated is now 0.8222 — several of those 6 ineligible rows are almost certainly eligible now, which changes both N and the mean in ways not reflected above. No faithfulness run has been made against the current retrieval arm.
+## Gated Faithfulness Re-Score - July 15
+
+**Motivation.** The "Routed Faithfulness Results" above (mean 5.000, N=9 eligible / 6 ineligible) were measured against the routed arm at recall@3 = 0.5667. Gating raised recall@3 to 0.8222 (see Jul 14 results above), so several of the 6 previously-ineligible rows are almost certainly eligible now — the old N and mean no longer describe the current retrieval arm.
+
+**Precondition, discovered this session.** No code path had ever connected gated retrieval to answer generation. `retrieve_for_route()` (the gate) was only ever called by the retrieval-only eval harness; `run_pipeline` — the function both the live app and `generation_capture.py` call — retrieved via plain `DB.semantic_search` regardless of gating. Fixed by adding a `use_confidence_gate` parameter to `run_pipeline`, valid only with `use_routing=True`: when set, the routed branch calls `retrieve_for_route` instead of `semantic_search`. Ungated paths (blind arm, and routed with the gate off) are untouched byte-for-byte — existing capture artifacts from those arms remain valid. A third capture arm (`generation_capture_gated.json`) was then run to produce answers actually generated against gated context, and faithfulness was re-scored against it, pointed at one of the three byte-identical `routed_with_fixes_gated` MLflow runs from Jul 14 via `recall_run_id` lineage.
+
+### Results
+
+| Arm | Faithfulness Mean | N Eligible | N Ineligible |
+|---|---|---|---|
+| Routed (Jul 14, stale) | 5.000 | 9 | 6 |
+| **Routed + fixes + gate (Jul 15)** | **4.429** | **14** | **1** |
+
+Reconciles: 14 + 1 = 15. The single gated-out row is **q004** — consistent with its Jul 14 root-cause diagnosis (dense search already correct at distance 0.3336, deferred to rewrite by the conservative threshold's design, rewrite answers it wrong). q004 being both the sole retrieval-ineligible row here and the concrete cost case named on Jul 14 is a second, independent confirmation of that diagnosis, not a new finding.
+
+**The mean dropping from 5.000 to 4.429 is not a quality regression.** N grew from 9 to 14 because eligibility (recall@3 > 0) tracks the retrieval arm, and recall@3 jumped 0.5667 → 0.8222 under gating. A mean computed over a larger, more honestly-sampled set moving off a suspiciously perfect 5.000 is the expected result of judging five previously-unscored rows, not evidence that gating made answers less faithful. Comparing 5.000/N=9 to 4.429/N=14 directly, as if they measured the same thing, would repeat the exact cross-run metric mismatch this pipeline's reconciliation discipline exists to prevent.
+
+### Judge reliability — bidirectional, not just lenient-on-refusal
+
+Three rows carry the actual finding this run adds.
+
+**q013 and q015 both scored 5 again** — the same refusal-trivially-passes pattern already documented on the routed arm (q013's blind→routed flip from 1→5 was shown there to be judge variance, not a caught error; q015 is the standing proof case for the judge's blind spot). Both recurring here, independently, on a different retrieval arm, is a second confirmation of an already-known pattern — not a new discovery on its own.
+
+**q003 is new** — it was ineligible under the pre-gate arm (recall@3 = 0) and only entered the scored set because gating fixed its retrieval. The query asks *which specific built-in Windows utilities* decode or deobfuscate a payload. The retrieved context (T1140 + a payload-compression chunk) discusses the technique substantively but never names a utility — "built-in functionality of malware or... utilities present on the system," no names given. The model's refusal here is arguably *correct*: naming a specific utility would have been the actual fabrication. The judge scored it **1**, reasoning the context "provides substantial information" — true of the technique in general, not of the specific thing asked.
+
+Set against q013 — whose context contains the literal answer twice ("Microsoft (Windows) Graphics Device Interface (GDI) Privilege Escalation Vulnerability," verbatim, across two chunks) and still refused, still scored 5 — the inconsistency is now bidirectional: the judge has under-penalized a wrongful refusal against a context with an exact match (q013, q015), and over-penalized a defensible refusal against a context with only generic relevance (q003), in the same eval set. There is no stable rule visible in the judge's behavior for how much context-relevance should excuse or convict a refusal.
+
+**Revised statement of the judge limitation:** not simply "biased toward scoring refusals high." The judge's refusal-handling is inconsistent in both directions — it has no reliable relationship between how well the context actually answers the question and the score a refusal against that context receives. This is a stronger and more precise claim than the one-directional blind spot named after the Jul 13/14 runs, and it further supports deferring a correctness-against-gold metric rather than trying to patch the faithfulness rubric to catch refusals — the failure mode isn't "too lenient," it's "uncorrelated with the thing that should determine the score."
+
+### Not addressed this run
+
+- Whether q013/q015's refusals should be treated as retrieval-adjacent findings (context contains a partial or full answer the prompt's strict grounding rule still forces a refusal on) is the same over-refusal tradeoff already characterized in Baseline Failure Analysis — not re-litigated here.
+- No change was made to the judge prompt or rubric in response to q003. The finding is recorded as evidence for the deferred correctness-vs-gold metric, not treated as something to patch via prompt engineering on the judge itself.
