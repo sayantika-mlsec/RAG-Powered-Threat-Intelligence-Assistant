@@ -127,7 +127,7 @@ The agentic routing layer was evaluated against the same K=3 harness and compare
 **The result is flat, and that is the finding.** Routing changed neither precision nor recall at K=3, with zero misroutes. Read together, those two facts localize what routing does and does not do:
 
 - **Routing did its job.** `n_misroutes = 0` means every scored query reached the correct corpus — no query was sent to the wrong store or wrongly skipped. Corpus selection is correct.
-- **Correct corpus selection did not move top-3.** The store imbalance the routing layer was built to counter (540 MITRE chunks vs 1600 KEV; per-corpus counts are not currently stamped in the artifact — only the combined 2140; per-corpus stamping is a scheduled fix) does distort deeper ranks — a MITRE query under `both` competes against 1600 KEV chunks — but for this eval set, recall was identical row-by-row between arms — consistent with the correct chunks already ranking in the top 3 under blind retrieval. (The per-row artifact does not yet store `retrieved_ids`, so top-3 identity is inferred from recall parity, not demonstrated chunk-by-chunk; adding `retrieved_ids` is a scheduled artifact upgrade.) Filtering out wrong-corpus chunks that sat at rank 4+ changed nothing about which three chunks won the top-3 slots. Routing removed noise that K=3 never saw.
+- **Correct corpus selection did not move top-3 — for 14 of 15 rows.** The store imbalance the routing layer was built to counter (540 MITRE chunks vs 1600 KEV, now confirmed via per-corpus corpus-stamp counts — see July 15 below) does distort deeper ranks — a MITRE query under `both` competes against 1600 KEV chunks — but for this eval set, recall was identical row-by-row between arms — consistent with the correct chunks already ranking in the top 3 under blind retrieval. This is now demonstrated directly, not just inferred from recall parity: see **Retrieved-IDs Verification** below. 14/15 scored rows have byte-identical `retrieved_ids` between arms; one row (q013) does not, though its score is unaffected. Filtering out wrong-corpus chunks that sat at rank 4+ changed nothing *material* about which three chunks won the top-3 slots for almost every row — not universally, as the flat-delta framing alone would suggest. Routing removed noise that K=3 never saw, on 14 of 15 rows.
 
 ### Per-category breakdown
 
@@ -318,3 +318,38 @@ Set against q013 — whose context contains the literal answer twice ("Microsoft
 
 - Whether q013/q015's refusals should be treated as retrieval-adjacent findings (context contains a partial or full answer the prompt's strict grounding rule still forces a refusal on) is the same over-refusal tradeoff already characterized in Baseline Failure Analysis — not re-litigated here.
 - No change was made to the judge prompt or rubric in response to q003. The finding is recorded as evidence for the deferred correctness-vs-gold metric, not treated as something to patch via prompt engineering on the judge itself.
+
+## Corpus Stamp — Per-Corpus Counts - July 16
+
+**Motivation.** The corpus stamp previously logged one combined chunk count (`chunk_count = 2140`), which cannot distinguish a genuine 540 MITRE / 1600 KEV split from any other pair of counts that happens to sum to the same total — an imbalance (e.g. a partial or failed ingest on one corpus) could sit hidden behind an unchanged combined number.
+
+**Fix.** `_corpus_stamp()` in `eval_retrieval.py` now reads MITRE and KEV chunk counts separately (`db.collection.get(where={"corpus": {"$eq": tag}}, include=[])`, counting `ids` only — no documents/metadata pulled unnecessarily) and reconciles them against the collection total before the run proceeds. A mismatch — a chunk untagged, mistagged, or tagged outside `{mitre, kev}` — now raises instead of silently producing a combined total that still looks correct.
+
+**Verified.** Ran against the live collection: MITRE and KEV counts sum to the total with no reconciliation failure, confirming the corpus is cleanly tagged. Per-corpus counts are now logged both in the MLflow run (`corpus_chunk_count_mitre`, `corpus_chunk_count_kev`, `corpus_chunk_count_total`) and in the artifact's `corpus_stamp` block.
+
+## Retrieved-IDs Verification (`compare_retrieval_arms.py`) - July 16
+
+**Motivation.** The Routing arm results section above previously stated routing's flat precision/recall delta meant "filtering out wrong-corpus chunks... changed nothing about which three chunks won the top-3 slots" — but that claim was inferred from recall parity, never demonstrated chunk-by-chunk, since the per-row artifact's `retrieved_ids` field had never actually been compared across arms. (`retrieved_ids` storage itself already existed in the artifact from earlier work; what was missing was the comparison.)
+
+**What was built.** `compare_retrieval_arms.py` — a standalone script that loads two retrieval-eval artifacts (local JSON path or MLflow run id, resolved the same way the faithfulness script resolves `recall_run_id`) and compares `retrieved_ids` row-by-row for every scored query id both arms share. Each row is classified `IDENTICAL`, `SAME_SET_DIFF_ORDER`, or `DIFFERENT`; rows in the `DIFFERENT` bucket are further split by whether the recall score moved or not — isolating the specific case precision/recall cannot surface: different retrieval, identical score.
+
+**Result — run against the live blind and routed MLflow runs:**
+
+| Status | Count |
+|---|---|
+| Identical | 14 |
+| Same set, different order | 0 |
+| Different sets | 1 |
+
+**q013 is the sole exception**, and it is exactly the invisible-to-metrics case the script was built to catch:
+
+| Arm | Retrieved (top 3) | Recall@3 |
+|---|---|---|
+| Blind | `T1068`, `CVE-2017-0005`, `CVE-2017-0001` | 1.0 |
+| Routed | `CVE-2017-0005`, `CVE-2017-0001`, `CVE-2019-0543` | 1.0 |
+
+Both arms retrieve the two correct CVEs (`CVE-2017-0001`, `CVE-2017-0005`) in the first two slots. The third slot differs: blind's whole-store search pulled in `T1068` — a MITRE technique, structurally irrelevant to a CVE-only query; routing to `kev_only` swapped it for a *different* wrong CVE, `CVE-2019-0543`. Recall and precision score both equally as "not expected," so neither metric moved — but the retrieved chunk itself is not the same chunk. This is a real effect of routing on retrieval composition that the flat aggregate delta reported above does not show.
+
+**Revised claim.** The "routing changed nothing about top-3" framing in the Routing arm results section is corrected to "changed nothing *material*, verified true for 14 of 15 scored rows, not universally true." The underlying finding — routing filters wrong-corpus noise that K=3 mostly never saw — still holds; it is now a demonstrated result over 14/15 rows rather than an assumption extrapolated from a flat metric delta over all 15.
+
+**Not addressed this run.** Whether `CVE-2019-0543`'s appearance in q013's `kev_only` search reflects a systematic property of `kev_only` filtering (e.g., the routed search's dense-ranking behavior changing once the candidate pool is restricted to KEV-only chunks) or is a one-off near-miss is not investigated here — `compare_retrieval_arms.py` surfaces the discrepancy, it does not diagnose its cause.
