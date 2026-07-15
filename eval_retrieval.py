@@ -42,6 +42,12 @@ PINNED_BASELINE_K = 3
 # ChromaDB — so it never throttles.
 THROTTLE_SECONDS = 6
 
+# Corpus tag values used throughout the project (exact_id.py, app.py's
+# _route_to_corpus, retrieve_for_route). Named here once so the corpus-stamp
+# reconciliation below isn't hardcoding string literals independently of the
+# rest of the codebase's usage.
+CORPUS_TAGS = ("mitre", "kev")
+
 
 def _route_to_corpus(route: Route) -> str | None:
     """Map a Route to the `corpus` arg for semantic_search. SKIP is handled by
@@ -55,6 +61,54 @@ def _route_to_corpus(route: Route) -> str | None:
     if route == Route.BOTH:
         return None
     raise ValueError(f"Unmapped non-skip route: {route!r}")
+
+
+def _corpus_stamp(db: ThreatIntelDB) -> dict:
+    """
+    Read the collection's chunk counts for the corpus stamp — PER CORPUS, not
+    just a combined total. A single combined count can hide an imbalance: e.g.
+    500 mitre + 1640 kev also sums to 2140, same as the expected 540 + 1600.
+    Per-corpus counts, reconciled against the combined total, turn that
+    silent-hiding failure mode into a fail-loud check instead.
+
+    include=[] on the per-corpus get() calls: only `ids` are needed to count,
+    so documents/metadatas are skipped rather than pulled and discarded.
+
+    Returns {"collection_name", "chunk_count_total", "chunk_count_mitre",
+    "chunk_count_kev"}. Raises RuntimeError if the two corpus counts don't
+    sum to the total — a chunk is then untagged, mistagged, or tagged with a
+    third corpus value not accounted for anywhere else in this project.
+    """
+    try:
+        collection_name = db.collection.name
+        total_count = db.collection.count()
+        per_corpus_counts = {
+            tag: len(db.collection.get(where={"corpus": {"$eq": tag}}, include=[])["ids"])
+            for tag in CORPUS_TAGS
+        }
+    except AttributeError as e:
+        raise RuntimeError(
+            "Could not read ChromaDB collection state for the corpus stamp "
+            "(expected db.collection.name / db.collection.count() / "
+            "db.collection.get())."
+        ) from e
+
+    summed = sum(per_corpus_counts.values())
+    if summed != total_count:
+        raise RuntimeError(
+            f"Corpus stamp reconciliation FAILED: "
+            f"{' + '.join(f'{tag} ({n})' for tag, n in per_corpus_counts.items())} "
+            f"= {summed}, but collection total is {total_count}. A chunk is "
+            f"untagged, mistagged, or tagged with a corpus value outside "
+            f"{CORPUS_TAGS} — refusing to write a stamp that can't account "
+            f"for every chunk."
+        )
+
+    return {
+        "collection_name": collection_name,
+        "chunk_count_total": total_count,
+        **{f"chunk_count_{tag}": n for tag, n in per_corpus_counts.items()},
+    }
 
 
 # ─── Evaluation Pipeline ──────────────────────────────────────────────────────
@@ -187,14 +241,10 @@ def run_evaluation(
     db = ThreatIntelDB()
 
     # ─── Corpus Stamp Extraction ───
-    try:
-        corpus_name = db.collection.name
-        corpus_size = db.collection.count()
-    except AttributeError as e:
-        raise RuntimeError(
-            "Could not read ChromaDB collection state for the corpus stamp "
-            "(expected db.collection.name / db.collection.count())."
-        ) from e
+    # Per-corpus counts (mitre / kev), reconciled against the combined total.
+    # See _corpus_stamp() docstring: a combined-only count can hide an
+    # imbalance a per-corpus split + reconciliation check cannot.
+    corpus_stamp = _corpus_stamp(db)
 
     metrics_tracker = defaultdict(lambda: {"precision_sum": 0.0, "recall_sum": 0.0, "count": 0})
     per_row_records = []
@@ -203,6 +253,11 @@ def run_evaluation(
         f"Evaluating {len(scored_queries)} scored queries at K={K} "
         f"(use_routing={use_routing}, use_retrieval_fixes={use_retrieval_fixes}, "
         f"use_confidence_gate={use_confidence_gate}, {len(gated_out)} gated out)..."
+    )
+    logger.info(
+        f"Corpus stamp: total={corpus_stamp['chunk_count_total']}, "
+        f"mitre={corpus_stamp['chunk_count_mitre']}, "
+        f"kev={corpus_stamp['chunk_count_kev']} (reconciled)."
     )
 
     global_precision_sum = 0.0
@@ -213,6 +268,9 @@ def run_evaluation(
     mlflow.log_metric("eval_dataset_size", len(scored_queries))
     mlflow.log_metric("n_gated_out", len(gated_out))
     mlflow.log_metric("eval_total_rows", total)
+    mlflow.log_metric("corpus_chunk_count_total", corpus_stamp["chunk_count_total"])
+    mlflow.log_metric("corpus_chunk_count_mitre", corpus_stamp["chunk_count_mitre"])
+    mlflow.log_metric("corpus_chunk_count_kev", corpus_stamp["chunk_count_kev"])
 
     made_live_call = False
 
@@ -382,11 +440,14 @@ def run_evaluation(
         "use_confidence_gate": use_confidence_gate,
         "retrieval_path_counts": path_counts,
         "corpus_stamp": {
-            "collection_name": corpus_name,
-            "chunk_count": corpus_size,
+            **corpus_stamp,
             "note": (
-                "Tracks chunk count only. Content-only edits at constant count "
-                "are NOT detected; corpus version is guaranteed by run lineage."
+                "Per-corpus counts (mitre/kev), reconciled against the "
+                "combined total at read time — a chunk untagged, mistagged, "
+                "or tagged outside {mitre, kev} would have raised before "
+                "this artifact was written. Content-only edits at constant "
+                "per-corpus count are NOT detected; corpus version is "
+                "guaranteed by run lineage."
             ),
         },
         "k_value": K,
