@@ -514,9 +514,21 @@ def run_pipeline(
         route_value    : the route string when routing ran, else None — for
                          logging and eval attribution
 
+    Tier dispatch: when routing runs, decision.tier is threaded into
+    ANALYZER.generate_answer so generation itself dispatches to Flash or Pro
+    per-query. The blind arm never computes a decision, so it passes
+    tier=None -> generate_answer defaults to FLASH, the same model it always
+    used — the blind baseline's model choice is unchanged. Return signature
+    is deliberately UNCHANGED here (still a 3-tuple): tier is not surfaced
+    as a fourth return value yet, since generation_capture.py may unpack
+    this positionally and hasn't been seen this session. Surfacing tier for
+    eval-tagging is Jul 25's task, once that file is in hand.
+
     The skip route returns a direct no-retrieval response (mode='no_retrieval'),
     a clean success distinct from a failure. Nothing touches ChromaDB on that
-    path, and the gate never runs on it.
+    path, and the gate never runs on it. Tier is also moot there —
+    route_query() already forces tier=FLASH on skip, and _no_retrieval_response
+    always generates on _ROUTER_MODEL directly, consistent with that.
     """
     if use_confidence_gate and not use_routing:
         raise ValueError(
@@ -540,7 +552,10 @@ def run_pipeline(
 
         decision = route_query(query, ROUTER_CLIENT)
         route_value = decision.route.value
-        logger.info(f"Route: {route_value}  ·  reasoning: {decision.reasoning[:120]}")
+        logger.info(
+            f"Route: {route_value}  ·  tier: {decision.tier.value}  ·  "
+            f"reasoning: {decision.reasoning[:120]}"
+        )
 
         corpus = _route_to_corpus(decision.route)
 
@@ -574,10 +589,19 @@ def run_pipeline(
             search_results = DB.semantic_search(query, n_results=n_results, corpus=corpus)
     else:
         # Blind baseline — no filter, whole store. Gate never applies here
-        # (guarded above), so this branch is untouched.
+        # (guarded above), so this branch is untouched. No routing decision
+        # exists on this branch, so no tier either.
         search_results = DB.semantic_search(query, n_results=n_results)
 
-    result = ANALYZER.generate_answer(query, search_results)
+    # decision is only assigned when use_routing=True, and every
+    # use_routing=True early-return path above (router-unavailable, skip)
+    # already returned before this line — so decision.tier is always safe
+    # to read here whenever use_routing is True.
+    result = ANALYZER.generate_answer(
+        query,
+        search_results,
+        tier=decision.tier if use_routing else None,
+    )
     return result, search_results, route_value
 
 

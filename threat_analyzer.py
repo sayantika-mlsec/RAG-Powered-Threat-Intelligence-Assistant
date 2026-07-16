@@ -9,6 +9,7 @@ from google.genai import types as genai_types
 from google.genai import errors as genai_errors
 
 from gemini_client import get_client
+from routing import ModelTier
 
 # ── Environment ───────────────────────────────────────────────────────────────
 # Loaded BEFORE `import config`, not after. This file is imported by app.py via
@@ -33,6 +34,21 @@ logger = logging.getLogger(__name__)
 
 # Model name as env variable — changing models in production = update .env, not code
 MODEL_NAME = os.getenv("GEMINI_MODEL_NAME", "gemini-2.5-flash")
+
+# Second tier's model — pro dispatch is new as of tiered routing (Jul 23-25).
+# Its own env var, not derived from MODEL_NAME, since the two tiers are
+# independently swappable in production.
+PRO_MODEL_NAME = os.getenv("GEMINI_PRO_MODEL_NAME", "gemini-2.5-pro")
+
+# Maps a routing decision's tier directly to the model string used for that
+# generation call. FLASH resolves to MODEL_NAME — the same model that was
+# hardcoded before tiering existed — so a query with no tier info (the blind
+# arm, or any caller not yet passing one) is byte-identical to pre-tiering
+# behavior. See generate_answer()'s tier=None default below.
+_TIER_MODEL = {
+    ModelTier.FLASH: MODEL_NAME,
+    ModelTier.PRO: PRO_MODEL_NAME,
+}
 
 SYSTEM_INSTRUCTION = (
     "You are a Senior SOC Analyst Assistant. "
@@ -222,7 +238,6 @@ class ThreatAnalyzer:
         (see module level), not baked into an object here.
         """
         self.client = get_client()
-        self.model_name = MODEL_NAME
 
     # ── Input validation ──────────────────────────────────────────────────────
 
@@ -292,7 +307,7 @@ class ThreatAnalyzer:
 
     # ── Core generation ───────────────────────────────────────────────────────
 
-    def _call_llm(self, prompt: str, query: str) -> tuple[str | None, str | None]:
+    def _call_llm(self, prompt: str, query: str, model_name: str) -> tuple[str | None, str | None]:
         """
         Calls the Gemini API (Vertex, via the new google.genai SDK) with
         explicit handling for every failure mode. Returns (answer_text,
@@ -314,7 +329,7 @@ class ThreatAnalyzer:
         """
         try:
             response = self.client.models.generate_content(
-                model=self.model_name,
+                model=model_name,
                 contents=prompt,
                 config=GENERATION_CONFIG,
             )
@@ -363,7 +378,8 @@ class ThreatAnalyzer:
     def generate_answer(
         self,
         query: str | None,
-        search_results: dict | None
+        search_results: dict | None,
+        tier: ModelTier | None = None,
     ) -> AnalysisResult:
         """
         Entry point for the generation pipeline.
@@ -372,12 +388,19 @@ class ThreatAnalyzer:
         Callers check result.success to branch UI state and use
         result.source_citations to render ATT&CK technique citations.
 
+        `tier` selects which model this call dispatches to (see _TIER_MODEL).
+        None resolves to ModelTier.FLASH — the blind arm (use_routing=False)
+        has no routing decision and therefore no tier, and any caller not
+        yet tier-aware gets the same model it always got. This keeps the
+        blind-arm baseline byte-identical; only routed queries with a real
+        tier decision can reach PRO.
+
         Pipeline stages (fail-fast at each):
           1. Validate query          — input contract
           2. Validate search_results — upstream contract + extract metadatas
           3. Truncate chunks         — chunk-level bounds (keeps metadata in sync)
           4. Build sanitized prompt  — security layer
-          5. Call LLM                — generation layer
+          5. Call LLM                — generation layer, dispatched by tier
         """
         # Stage 1 — query validation
         query, query_error = self._validate_query(query)
@@ -407,8 +430,12 @@ class ThreatAnalyzer:
         # Stage 4 — sanitized prompt construction
         prompt = _build_prompt(query, context_chunks)
 
-        # Stage 5 — LLM call
-        answer, llm_error = self._call_llm(prompt, query)
+        # Stage 5 — LLM call, dispatched by tier
+        resolved_tier = tier if tier is not None else ModelTier.FLASH
+        model_name = _TIER_MODEL[resolved_tier]
+        logger.info(f"Dispatching generation: tier={resolved_tier.value} -> model={model_name}")
+
+        answer, llm_error = self._call_llm(prompt, query, model_name)
         if llm_error:
             return AnalysisResult.fail(llm_error)
 
