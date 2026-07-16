@@ -479,7 +479,7 @@ def run_pipeline(
     use_routing: bool,
     n_results: int = N_RESULTS,
     use_confidence_gate: bool = False,
-) -> tuple[AnalysisResult, dict, str | None]:
+) -> tuple[AnalysisResult, dict, str | None, str | None]:
     """
     Full RAG pipeline — the single entry point shared by the Gradio UI and the
     eval harness. `use_routing` is the primary A/B variable, which is what
@@ -506,29 +506,36 @@ def run_pipeline(
     gating has no meaning without a route to gate within. Fail loud rather
     than silently ignoring the flag.
 
-    Returns (result, search_results, route_value):
+    Returns (result, search_results, route_value, tier_value):
         result         : AnalysisResult from the generation layer
         search_results : the raw dict from semantic_search / retrieve_for_route
                          (same documents/metadatas shape either way, so
                          downstream citation/status formatting is unchanged)
         route_value    : the route string when routing ran, else None — for
                          logging and eval attribution
+        tier_value     : the tier string ('flash'/'pro') when routing ran,
+                         else None. Added for Jul 25's tagged eval — previously
+                         computed internally but not surfaced past this
+                         function; generation_capture.py needs it on every
+                         record to tag cost/latency by tier downstream. This
+                         IS a breaking change to this function's return arity
+                         (3-tuple -> 4-tuple): every positional caller —
+                         handle_query() below, and generation_capture.py —
+                         is updated in this same change.
 
     Tier dispatch: when routing runs, decision.tier is threaded into
     ANALYZER.generate_answer so generation itself dispatches to Flash or Pro
     per-query. The blind arm never computes a decision, so it passes
     tier=None -> generate_answer defaults to FLASH, the same model it always
-    used — the blind baseline's model choice is unchanged. Return signature
-    is deliberately UNCHANGED here (still a 3-tuple): tier is not surfaced
-    as a fourth return value yet, since generation_capture.py may unpack
-    this positionally and hasn't been seen this session. Surfacing tier for
-    eval-tagging is Jul 25's task, once that file is in hand.
+    used — the blind baseline's model choice is unchanged.
 
     The skip route returns a direct no-retrieval response (mode='no_retrieval'),
     a clean success distinct from a failure. Nothing touches ChromaDB on that
     path, and the gate never runs on it. Tier is also moot there —
     route_query() already forces tier=FLASH on skip, and _no_retrieval_response
-    always generates on _ROUTER_MODEL directly, consistent with that.
+    always generates on _ROUTER_MODEL directly, consistent with that — but the
+    forced 'flash' value is still returned as tier_value, not None, since a
+    routing decision genuinely was made on this path.
     """
     if use_confidence_gate and not use_routing:
         raise ValueError(
@@ -538,6 +545,7 @@ def run_pipeline(
 
     empty_results = {"documents": [[]], "metadatas": [[]], "error": None}
     route_value: str | None = None
+    tier_value: str | None = None
 
     if use_routing:
         if ROUTER_CLIENT is None:
@@ -548,12 +556,14 @@ def run_pipeline(
                 AnalysisResult.fail("Router unavailable — check GCP_PROJECT_ID/ADC (see gemini_client.py)."),
                 empty_results,
                 None,
+                None,
             )
 
         decision = route_query(query, ROUTER_CLIENT)
         route_value = decision.route.value
+        tier_value = decision.tier.value
         logger.info(
-            f"Route: {route_value}  ·  tier: {decision.tier.value}  ·  "
+            f"Route: {route_value}  ·  tier: {tier_value}  ·  "
             f"reasoning: {decision.reasoning[:120]}"
         )
 
@@ -566,6 +576,7 @@ def run_pipeline(
                 _no_retrieval_response(query),
                 empty_results,
                 route_value,
+                tier_value,
             )
 
         if use_confidence_gate:
@@ -595,14 +606,15 @@ def run_pipeline(
 
     # decision is only assigned when use_routing=True, and every
     # use_routing=True early-return path above (router-unavailable, skip)
-    # already returned before this line — so decision.tier is always safe
-    # to read here whenever use_routing is True.
+    # already returned before this line — so tier_value is always set
+    # (non-None) here whenever use_routing is True, and stays None on the
+    # blind arm exactly as initialized above.
     result = ANALYZER.generate_answer(
         query,
         search_results,
         tier=decision.tier if use_routing else None,
     )
-    return result, search_results, route_value
+    return result, search_results, route_value, tier_value
 
 
 # ── Core Query Handler ────────────────────────────────────────────────────────
@@ -640,7 +652,7 @@ def handle_query(query: str) -> tuple[str, str, str]:
 
     # ── RAG pipeline (routing on) ─────────────────────────────────────────────
     try:
-        result, search_results, route_value = run_pipeline(query, use_routing=True)
+        result, search_results, route_value, tier_value = run_pipeline(query, use_routing=True)
     except Exception as e:
         logger.error(f"Unhandled pipeline error: {e}", exc_info=True)
         return (
