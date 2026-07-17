@@ -1,6 +1,7 @@
 import os
 import html
 import logging
+import time
 from dataclasses import dataclass, field
 from dotenv import load_dotenv
 from pathlib import Path
@@ -9,6 +10,7 @@ from google.genai import types as genai_types
 from google.genai import errors as genai_errors
 
 from gemini_client import get_client
+from routing import ModelTier
 
 # ── Environment ───────────────────────────────────────────────────────────────
 # Loaded BEFORE `import config`, not after. This file is imported by app.py via
@@ -33,6 +35,21 @@ logger = logging.getLogger(__name__)
 
 # Model name as env variable — changing models in production = update .env, not code
 MODEL_NAME = os.getenv("GEMINI_MODEL_NAME", "gemini-2.5-flash")
+
+# Second tier's model — pro dispatch is new as of tiered routing (Jul 23-25).
+# Its own env var, not derived from MODEL_NAME, since the two tiers are
+# independently swappable in production.
+PRO_MODEL_NAME = os.getenv("GEMINI_PRO_MODEL_NAME", "gemini-2.5-pro")
+
+# Maps a routing decision's tier directly to the model string used for that
+# generation call. FLASH resolves to MODEL_NAME — the same model that was
+# hardcoded before tiering existed — so a query with no tier info (the blind
+# arm, or any caller not yet passing one) is byte-identical to pre-tiering
+# behavior. See generate_answer()'s tier=None default below.
+_TIER_MODEL = {
+    ModelTier.FLASH: MODEL_NAME,
+    ModelTier.PRO: PRO_MODEL_NAME,
+}
 
 SYSTEM_INSTRUCTION = (
     "You are a Senior SOC Analyst Assistant. "
@@ -71,6 +88,15 @@ class AnalysisResult:
     error:            str | None = None
     context_used:     list[str] = field(default_factory=list)
     mode:             str = "retrieved"   # "retrieved" | "no_retrieval"
+    # Usage/timing — populated by generate_answer() after _call_llm() returns.
+    # None on the no_retrieval (skip) path, since that path never calls
+    # ThreatAnalyzer at all (see app.py's _no_retrieval_response) — tier
+    # dispatch was already forced to flash there and isn't part of what
+    # the cost/latency table is measuring.
+    latency_seconds:  float | None = None
+    input_tokens:     int | None = None
+    output_tokens:    int | None = None
+    thinking_tokens:  int | None = None
 
     @classmethod
     def ok(cls, answer: str, citations: list[dict], context_used: list[str]) -> "AnalysisResult":
@@ -222,7 +248,6 @@ class ThreatAnalyzer:
         (see module level), not baked into an object here.
         """
         self.client = get_client()
-        self.model_name = MODEL_NAME
 
     # ── Input validation ──────────────────────────────────────────────────────
 
@@ -292,11 +317,32 @@ class ThreatAnalyzer:
 
     # ── Core generation ───────────────────────────────────────────────────────
 
-    def _call_llm(self, prompt: str, query: str) -> tuple[str | None, str | None]:
+    def _call_llm(self, prompt: str, query: str, model_name: str) -> tuple[str | None, str | None, dict]:
         """
         Calls the Gemini API (Vertex, via the new google.genai SDK) with
         explicit handling for every failure mode. Returns (answer_text,
-        error_reason) — exactly one will be None.
+        error_reason, usage) — exactly one of answer_text/error_reason will
+        be None.
+
+        `usage` is a dict with keys 'latency_seconds', 'input_tokens',
+        'output_tokens', 'thinking_tokens'. Populated whenever a response
+        object was actually received from the API — even a safety-blocked
+        or otherwise-failed-post-response call still has real latency and
+        (usually) real token counts worth capturing. All four values are
+        None only when the API call itself raised before any response
+        existed (quota exhaustion, malformed request, server error,
+        network failure) — there's nothing to measure in that case.
+
+        Token counts read from response.usage_metadata — field names
+        (prompt_token_count, candidates_token_count, thoughts_token_count)
+        confirmed against Google's own API docs and real SDK response
+        objects, not assumed. thinking stays ON for this call (a deliberate
+        choice, unlike every other Gemini call site in this project, which
+        all set thinking_budget=0) — thoughts_token_count is captured as
+        its own field, separate from candidates_token_count, even though
+        Google's pricing bills them together as "output" tokens. Keeping
+        them separate lets the eventual cost table show how much of a
+        Pro call's cost is the visible answer vs. invisible reasoning.
 
         Failure taxonomy:
           - Safety blocks     → security signal, log at WARNING, return user-safe message
@@ -312,12 +358,36 @@ class ThreatAnalyzer:
         anything — every real error would silently fall through to the generic
         catch-all with a less specific message.
         """
+        empty_usage = {
+            "latency_seconds": None,
+            "input_tokens": None,
+            "output_tokens": None,
+            "thinking_tokens": None,
+        }
+        start = time.perf_counter()
         try:
             response = self.client.models.generate_content(
-                model=self.model_name,
+                model=model_name,
                 contents=prompt,
                 config=GENERATION_CONFIG,
             )
+            latency = time.perf_counter() - start
+
+            usage_meta = getattr(response, "usage_metadata", None)
+            if usage_meta is None:
+                logger.warning(
+                    f"No usage_metadata on response for query '{query[:80]}' — "
+                    f"token counts unavailable for this call (latency still captured)."
+                )
+                usage = {**empty_usage, "latency_seconds": latency}
+            else:
+                usage = {
+                    "latency_seconds": latency,
+                    "input_tokens": getattr(usage_meta, "prompt_token_count", None),
+                    "output_tokens": getattr(usage_meta, "candidates_token_count", None),
+                    "thinking_tokens": getattr(usage_meta, "thoughts_token_count", None),
+                }
+
             text, error_reason = _safe_extract_text(response)
 
             if error_reason:
@@ -331,24 +401,30 @@ class ThreatAnalyzer:
                     return (
                         None,
                         "This query triggered a content safety filter. "
-                        "SOC supervisor review recommended."
+                        "SOC supervisor review recommended.",
+                        usage,
                     )
                 logger.error(f"Generation failed with reason: {error_reason}")
-                return None, "An error occurred during threat analysis."
+                return None, "An error occurred during threat analysis.", usage
 
-            logger.info(f"Generation successful. Response length: {len(text)} chars.")
-            return text, None
+            logger.info(
+                f"Generation successful. Response length: {len(text)} chars. "
+                f"Latency: {latency:.2f}s. "
+                f"Tokens: in={usage['input_tokens']} out={usage['output_tokens']} "
+                f"thinking={usage['thinking_tokens']}."
+            )
+            return text, None, usage
 
         except genai_errors.ClientError as e:
             if getattr(e, "code", None) == 429:
                 logger.error("Gemini API quota exhausted. Implement exponential backoff.")
-                return None, "Service temporarily unavailable — API quota reached."
+                return None, "Service temporarily unavailable — API quota reached.", empty_usage
             logger.error(f"Malformed request to Gemini API: {e}")
-            return None, "An error occurred during threat analysis."
+            return None, "An error occurred during threat analysis.", empty_usage
 
         except genai_errors.ServerError as e:
             logger.error(f"Gemini API server error: {e}")
-            return None, "Service temporarily unavailable — try again shortly."
+            return None, "Service temporarily unavailable — try again shortly.", empty_usage
 
         except Exception as e:
             # exc_info=True attaches the full stack trace — saves hours of debugging.
@@ -356,14 +432,15 @@ class ThreatAnalyzer:
                 f"Unexpected LLM generation error for query '{query[:80]}': {e}",
                 exc_info=True
             )
-            return None, "An error occurred during threat analysis."
+            return None, "An error occurred during threat analysis.", empty_usage
 
     # ── Public interface ──────────────────────────────────────────────────────
 
     def generate_answer(
         self,
         query: str | None,
-        search_results: dict | None
+        search_results: dict | None,
+        tier: ModelTier | None = None,
     ) -> AnalysisResult:
         """
         Entry point for the generation pipeline.
@@ -372,12 +449,19 @@ class ThreatAnalyzer:
         Callers check result.success to branch UI state and use
         result.source_citations to render ATT&CK technique citations.
 
+        `tier` selects which model this call dispatches to (see _TIER_MODEL).
+        None resolves to ModelTier.FLASH — the blind arm (use_routing=False)
+        has no routing decision and therefore no tier, and any caller not
+        yet tier-aware gets the same model it always got. This keeps the
+        blind-arm baseline byte-identical; only routed queries with a real
+        tier decision can reach PRO.
+
         Pipeline stages (fail-fast at each):
           1. Validate query          — input contract
           2. Validate search_results — upstream contract + extract metadatas
           3. Truncate chunks         — chunk-level bounds (keeps metadata in sync)
           4. Build sanitized prompt  — security layer
-          5. Call LLM                — generation layer
+          5. Call LLM                — generation layer, dispatched by tier
         """
         # Stage 1 — query validation
         query, query_error = self._validate_query(query)
@@ -407,19 +491,36 @@ class ThreatAnalyzer:
         # Stage 4 — sanitized prompt construction
         prompt = _build_prompt(query, context_chunks)
 
-        # Stage 5 — LLM call
-        answer, llm_error = self._call_llm(prompt, query)
+        # Stage 5 — LLM call, dispatched by tier
+        resolved_tier = tier if tier is not None else ModelTier.FLASH
+        model_name = _TIER_MODEL[resolved_tier]
+        logger.info(f"Dispatching generation: tier={resolved_tier.value} -> model={model_name}")
+
+        answer, llm_error, usage = self._call_llm(prompt, query, model_name)
+
         if llm_error:
-            return AnalysisResult.fail(llm_error)
+            result = AnalysisResult.fail(llm_error)
+        else:
+            # Deduplicate citations by technique_id — multiple chunks from the
+            # same technique should appear as one citation in the UI, not N.
+            seen: set[str] = set()
+            unique_citations: list[dict] = []
+            for meta in metadatas:
+                tid = meta.get("technique_id", meta.get("source", "unknown"))
+                if tid not in seen:
+                    seen.add(tid)
+                    unique_citations.append(meta)
 
-        # Deduplicate citations by technique_id — multiple chunks from the
-        # same technique should appear as one citation in the UI, not N.
-        seen: set[str] = set()
-        unique_citations: list[dict] = []
-        for meta in metadatas:
-            tid = meta.get("technique_id", meta.get("source", "unknown"))
-            if tid not in seen:
-                seen.add(tid)
-                unique_citations.append(meta)
+            result = AnalysisResult.ok(answer=answer, citations=unique_citations, context_used=context_chunks)
 
-        return AnalysisResult.ok(answer=answer, citations=unique_citations, context_used=context_chunks)
+        # Attached regardless of success/failure — usage is real whenever a
+        # response was received (see _call_llm docstring), and a failed
+        # generation's latency/token cost is still real spend worth knowing
+        # about, even though it won't feed the per-tier cost table (that
+        # only aggregates generation_ok=True rows).
+        result.latency_seconds = usage["latency_seconds"]
+        result.input_tokens = usage["input_tokens"]
+        result.output_tokens = usage["output_tokens"]
+        result.thinking_tokens = usage["thinking_tokens"]
+
+        return result

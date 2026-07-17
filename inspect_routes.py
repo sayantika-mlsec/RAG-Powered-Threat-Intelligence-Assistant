@@ -67,14 +67,19 @@ def main():
     mismatches = []
     errors = []
     print(f"throttle: {args.delay}s between calls | {len(rows)} rows\n")
-    print(f"{'id':<6} {'expected':<11} {'predicted':<11} {'ok':<3} query")
+    # tier has no expected_tier ground truth yet (eval_set.json isn't tagged
+    # for it) — printed for visual sanity-check only, not scored. Tier
+    # accuracy gets a real eval, once tagged runs exist.
+    print(f"{'id':<6} {'expected':<11} {'predicted':<11} {'tier':<6} {'ok':<3} query")
     print("-" * 100)
 
     for i, r in enumerate(rows):
         expected = r["expected_route"]
+        tier = "?"
         try:
             decision = route_query(r["query"], client)
             predicted = decision.route.value
+            tier = decision.tier.value
             reasoning = decision.reasoning
         except Exception as e:
             predicted = f"ERROR:{type(e).__name__}"
@@ -86,7 +91,7 @@ def main():
             mismatches.append((r["id"], expected, predicted, r["query"], reasoning))
 
         q = r["query"][:60] + ("…" if len(r["query"]) > 60 else "")
-        print(f"{r['id']:<6} {expected:<11} {predicted:<11} {ok:<3} {q}")
+        print(f"{r['id']:<6} {expected:<11} {predicted:<11} {tier:<6} {ok:<3} {q}")
 
         # Throttle between calls, but not after the last one.
         if i < len(rows) - 1:

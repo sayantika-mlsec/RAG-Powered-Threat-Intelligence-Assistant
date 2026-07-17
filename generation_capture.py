@@ -112,13 +112,31 @@ def capture_row(
                             scoring downstream; a no-claims answer trivially passes
                             grounding, so it must not enter the faithfulness set)
       - failure           : generation_ok=False, answer null, flagged
+
+    `tier` is recorded on every row (None on the blind arm, same as `route`) —
+    this is what Jul 25's cost/latency-per-tier table groups by downstream.
+
+    `latency_seconds`/`input_tokens`/`output_tokens`/`thinking_tokens` come
+    straight from AnalysisResult (see threat_analyzer.py) — None on the
+    no_retrieval (skip) path, since that path never calls ThreatAnalyzer at
+    all. thinking is deliberately left ON for these calls (not disabled like
+    every other Gemini call site in this project), so output_tokens and
+    thinking_tokens are tracked as separate fields even though Google bills
+    them together — the eventual table can show the split.
     """
-    result, _search_results, route_value = run_pipeline(
+    result, _search_results, route_value, tier_value = run_pipeline(
         query,
         use_routing=use_routing,
         n_results=config.RETRIEVAL_TOP_K,
         use_confidence_gate=use_confidence_gate,
     )
+
+    usage_fields = {
+        "latency_seconds": getattr(result, "latency_seconds", None),
+        "input_tokens": getattr(result, "input_tokens", None),
+        "output_tokens": getattr(result, "output_tokens", None),
+        "thinking_tokens": getattr(result, "thinking_tokens", None),
+    }
 
     if result.success:
         # Skip path: no retrieval happened, so there is no grounding context.
@@ -132,10 +150,12 @@ def capture_row(
             "generation_ok": True,
             "mode": getattr(result, "mode", "retrieved"),
             "route": route_value,                         # None on the blind arm
+            "tier": tier_value,                            # None on the blind arm
             "generated_answer": result.answer,
             "retrieved_context": retrieved_context,       # post-truncation / empty on skip
             "citations": result.source_citations,
             "error": None,
+            **usage_fields,
         }
 
     logger.warning(f"Generation failed for {row_id}: {result.error}")
@@ -145,17 +165,44 @@ def capture_row(
         "generation_ok": False,
         "mode": getattr(result, "mode", "retrieved"),
         "route": route_value,
+        "tier": tier_value,
         "generated_answer": None,
         "retrieved_context": [],
         "citations": [],
         "error": result.error,
+        **usage_fields,
     }
+
+
+# The full set of keys every row this script writes is expected to have.
+# Used to detect rows captured under an OLDER (narrower) version of this
+# script's record schema — e.g. rows captured before the "tier" field was
+# added. Keeping this explicit means a future field addition makes old rows
+# fail this check automatically, instead of relying on someone to remember
+# to delete stale artifacts by hand every time the schema grows.
+REQUIRED_ROW_KEYS = {
+    "id", "query", "generation_ok", "mode", "route", "tier",
+    "generated_answer", "retrieved_context", "citations", "error",
+    "latency_seconds", "input_tokens", "output_tokens", "thinking_tokens",
+}
 
 
 def _load_existing(out_path: str) -> dict[str, dict]:
     """
     Load already-captured rows from a prior run of THIS arm, keyed by id.
-    Only SUCCESSFUL rows are kept — failed rows are dropped so they get retried.
+
+    A row is reused only if BOTH:
+      - generation_ok is True (a real failure always gets retried)
+      - it has every key in REQUIRED_ROW_KEYS (schema-complete)
+
+    The second check exists because a prior artifact may have been captured
+    under an older, narrower record schema (e.g. rows written before the
+    "tier" field existed). Such a row is generation_ok=True but silently
+    missing data downstream code now expects — reusing it as-is would
+    produce a mixed artifact where some rows have tier and others don't,
+    with nothing flagging that it happened. Treated the same as a failed
+    row here: dropped, and regenerated on this run.
+
     Returns {} if no prior artifact exists, or if the file is corrupt (e.g. a
     torn write from a hard crash) — treated the same as "nothing captured yet"
     rather than crashing the whole script before a single row is attempted.
@@ -170,12 +217,28 @@ def _load_existing(out_path: str) -> dict[str, dict]:
     except json.JSONDecodeError:
         logger.warning(f"{out_path} is corrupt/unreadable — starting fresh for this arm.")
         return {}
-    kept = {
-        r["id"]: r
-        for r in prior.get("rows", [])
-        if r.get("generation_ok")
-    }
-    logger.info(f"Found prior artifact: reusing {len(kept)} already-succeeded row(s).")
+
+    kept: dict[str, dict] = {}
+    stale_schema_ids: list[str] = []
+    for r in prior.get("rows", []):
+        if not r.get("generation_ok"):
+            continue
+        if not REQUIRED_ROW_KEYS.issubset(r.keys()):
+            stale_schema_ids.append(r.get("id", "<no id>"))
+            continue
+        kept[r["id"]] = r
+
+    logger.info(
+        f"Found prior artifact: reusing {len(kept)} already-succeeded, "
+        f"schema-complete row(s)."
+    )
+    if stale_schema_ids:
+        missing_example = sorted(REQUIRED_ROW_KEYS)
+        logger.warning(
+            f"{len(stale_schema_ids)} row(s) captured under an older record "
+            f"schema (missing one or more of {missing_example}) — will be "
+            f"regenerated this run: {sorted(stale_schema_ids)}"
+        )
     return kept
 
 
@@ -266,16 +329,22 @@ def run_capture(
                 "generation_ok": False,
                 "mode": None,
                 "route": None,
+                "tier": None,
                 "generated_answer": None,
                 "retrieved_context": [],
                 "citations": [],
                 "error": str(e),
+                "latency_seconds": None,
+                "input_tokens": None,
+                "output_tokens": None,
+                "thinking_tokens": None,
             }
 
         made_live_call = True
         records_by_id[row_id] = record
         logger.info(
-            f"Captured {row_id} (ok={record['generation_ok']}, route={record['route']}, mode={record['mode']})."
+            f"Captured {row_id} (ok={record['generation_ok']}, route={record['route']}, "
+            f"tier={record['tier']}, mode={record['mode']})."
         )
 
         # CHECKPOINT after every row. Worst case on a crash: you lose the one
