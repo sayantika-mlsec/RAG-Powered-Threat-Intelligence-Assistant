@@ -115,6 +115,14 @@ def capture_row(
 
     `tier` is recorded on every row (None on the blind arm, same as `route`) —
     this is what Jul 25's cost/latency-per-tier table groups by downstream.
+
+    `latency_seconds`/`input_tokens`/`output_tokens`/`thinking_tokens` come
+    straight from AnalysisResult (see threat_analyzer.py) — None on the
+    no_retrieval (skip) path, since that path never calls ThreatAnalyzer at
+    all. thinking is deliberately left ON for these calls (not disabled like
+    every other Gemini call site in this project), so output_tokens and
+    thinking_tokens are tracked as separate fields even though Google bills
+    them together — the eventual table can show the split.
     """
     result, _search_results, route_value, tier_value = run_pipeline(
         query,
@@ -122,6 +130,13 @@ def capture_row(
         n_results=config.RETRIEVAL_TOP_K,
         use_confidence_gate=use_confidence_gate,
     )
+
+    usage_fields = {
+        "latency_seconds": getattr(result, "latency_seconds", None),
+        "input_tokens": getattr(result, "input_tokens", None),
+        "output_tokens": getattr(result, "output_tokens", None),
+        "thinking_tokens": getattr(result, "thinking_tokens", None),
+    }
 
     if result.success:
         # Skip path: no retrieval happened, so there is no grounding context.
@@ -140,6 +155,7 @@ def capture_row(
             "retrieved_context": retrieved_context,       # post-truncation / empty on skip
             "citations": result.source_citations,
             "error": None,
+            **usage_fields,
         }
 
     logger.warning(f"Generation failed for {row_id}: {result.error}")
@@ -154,6 +170,7 @@ def capture_row(
         "retrieved_context": [],
         "citations": [],
         "error": result.error,
+        **usage_fields,
     }
 
 
@@ -166,6 +183,7 @@ def capture_row(
 REQUIRED_ROW_KEYS = {
     "id", "query", "generation_ok", "mode", "route", "tier",
     "generated_answer", "retrieved_context", "citations", "error",
+    "latency_seconds", "input_tokens", "output_tokens", "thinking_tokens",
 }
 
 
@@ -316,6 +334,10 @@ def run_capture(
                 "retrieved_context": [],
                 "citations": [],
                 "error": str(e),
+                "latency_seconds": None,
+                "input_tokens": None,
+                "output_tokens": None,
+                "thinking_tokens": None,
             }
 
         made_live_call = True
