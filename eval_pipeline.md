@@ -372,7 +372,7 @@ Both arms retrieve the two correct CVEs (`CVE-2017-0001`, `CVE-2017-0005`) in th
 
 **Verified, not assumed.** A standalone script ran a known `pro`-tier query (q005) and a known `flash`-tier query (q001) through the *full* pipeline and confirmed the two relevant log lines agree end-to-end: routing's computed tier, and generation's actually-dispatched model. Both matched (`tier=pro -> model=gemini-2.5-pro`; `tier=flash -> model=gemini-2.5-flash`). This closes a gap a routing-only check can't: tier can compute correctly in `routing.py` and still fail to reach the model-selection call if the wiring between them is wrong. It wasn't.
 
-## Tier-Tagged Capture — Distribution and Stability - July 17 (in progress)
+## Tier-Tagged Capture — Distribution and Stability - July 17 
 
 **Scope of this entry.** Covers the first part of Jul 17's task — tagging capture data by tier, and the stability question that surfaced doing it. The cost/latency-per-tier table itself is **not yet built**: that requires token-usage and latency capture in `threat_analyzer.py` (not yet added) and current Gemini Flash/Pro pricing (not yet pulled). Both still pending.
 
@@ -389,6 +389,40 @@ Both arms retrieve the two correct CVEs (`CVE-2017-0001`, `CVE-2017-0005`) in th
 
 **These two numbers are not a before/after drift measurement — the first is superseded, not compared against.** The Jul 17 spot-check ran before `temperature` was pinned on the routing call; the Jul 17 capture is the first full-suite run under the fixed config. Reading 25%→35% as "the pro rate increased over time" would repeat the exact cross-run comparison error this doc's reconciliation discipline exists to prevent elsewhere (see Jul 15's 5.000-vs-4.429 entry, same shape of mistake). The correct read: two queries the *unpinned* call had classified `flash` (q003, q013) resolve to `pro` under the *pinned* call — both verified stable across 3 repeated runs each, the same verification q002 got. The routed arm's tier distribution, as best currently known, is **13 flash / 7 pro (35% pro)** — three boundary-adjacent queries (q002, q003, q013) confirmed stable by repetition, not taken on a single classification.
 
-**Capture results.** `python generation_capture.py --use-routing`: 20/20 rows regenerated (0 reused — all were schema-stale), 20 generated, 0 failed, 4 skip-routed (q017–q020, consistent with the existing skip set, all `tier=flash` as enforced Jul 23). Route distribution unchanged from the existing baseline (0 misroutes) — tier is the only new information in this artifact.
+**Capture results.** `python generation_capture.py --use-routing`: 20/20 rows regenerated (0 reused — all were schema-stale), 20 generated, 0 failed, 4 skip-routed (q017–q020, consistent with the existing skip set, all `tier=flash` as enforced Jul 17). Route distribution unchanged from the existing baseline (0 misroutes) — tier is the only new information in this artifact.
 
 **Not addressed yet.** Whether 35% is a "good" or "expected" pro rate has no reference point defined anywhere in this project — no target ratio exists to compare against. It's reported here as a measured fact for the eventual cost/latency table to interpret, not evaluated as good or bad on its own.
+ 
+### Cost/Latency-Per-Tier Table
+ 
+**Design choice: thinking left on.** Every other Gemini call site in this project (router, rewrite, judge) explicitly disables thinking via `thinking_budget=0`. The actual answer-generation call never has, and that was kept deliberately rather than changed to match — meaning the numbers below reflect real production behavior including thinking, not a controlled/minimized comparison. This also means latency and cost here could vary run-to-run at the same `temperature=0.0`, for the same reason tier classification itself did (Gemini's own floating-point non-determinism, not a bug).
+ 
+**Token/timing capture, added this session.** `ThreatAnalyzer.generate_answer()` now returns `latency_seconds`, `input_tokens`, `output_tokens`, and `thinking_tokens` on every `AnalysisResult` — extracted from `response.usage_metadata` (field names confirmed against Google's own docs and real SDK response objects: `prompt_token_count`, `candidates_token_count`, `thoughts_token_count` — not guessed). `generation_capture.py`'s schema grew to match, which correctly re-flagged the capture from earlier in this same session as stale and forced a clean regeneration under the new schema — the same protective mechanism built earlier in the day working as intended a second time.
+ 
+**Pricing** (pulled 2026-07-17 from `ai.google.dev/gemini-api/docs/pricing`, Developer API Standard tier, ≤200k-token prompts): Flash $0.30/$2.50 per 1M input/output tokens; Pro $1.25/$10.00. **Not confirmed identical to Vertex AI pricing** — this project bills against Vertex, and while Google has historically kept the two aligned per-token, that hasn't been checked against the actual GCP billing console. Treat the dollar figures below as directionally correct, not final.
+ 
+**Results** (`generation_capture_routed.json`, 16 usable rows — excludes the 4 skip rows, which never call `ThreatAnalyzer` and so have no usage data to report):
+ 
+| Tier | N | Avg latency | Avg cost | Total cost | Avg input tok | Avg output tok | Avg thinking tok |
+|---|---|---|---|---|---|---|---|
+| flash | 9 | 2.74s | $0.00105 | $0.00941 | 647 | 25 | 316 |
+| pro | 7 | 11.37s | $0.01243 | $0.08703 | 585 | 80 | 1091 |
+ 
+**Hypothetical — same 16 calls, uniform tier** (holds each row's actual token counts fixed and re-prices at a single tier; an approximation, not a re-measurement — a real all-Pro run could produce different token counts than Flash did on the same query, since Pro may reason more or less):
+ 
+| Scenario | Total cost |
+|---|---|
+| Actual (tiered) | $0.09643 |
+| All-Flash | $0.03111 |
+| All-Pro | $0.12494 |
+ 
+**Tiering saves 22.8% vs. all-Pro ($0.02851 over 16 calls) but costs 210.0% more than all-Flash ($0.06532 over 16 calls)** — the premium for routing 7/16 (44%) of usable queries to Pro. Read honestly, not as a headline: this is real evidence tiering is cheaper than treating every query as Pro-worthy, but the savings are modest, not dramatic, because 44% of queries still land on the tier that costs roughly 12x more per call ($0.01243 vs $0.00105 average).
+ 
+**Where that 12x actually comes from.** Two compounding factors, not one: Pro's per-token price is 4x Flash's on both input and output, *and* Pro produced 3.5x more thinking tokens on average (1091 vs 316) on top of that. Both tiers show thinking dominating visible output by a similar ratio (flash ≈12.6x output, pro ≈13.6x output) — so this isn't Pro "thinking proportionally harder," it's Pro thinking in absolute terms more, at a steeper per-token rate, on the same general thinking-to-output shape Flash already has.
+ 
+**Latency.** Pro averages 4.15x Flash's latency (11.37s vs 2.74s) — a real, user-facing cost on every query routed there, not just a billing line item.
+ 
+**What this table does not show.** Whether Pro's answers on those 7 queries are actually better than Flash would have produced is not measured here — no faithfulness or correctness comparison exists between flash-generated and pro-generated answers on the same queries. This table establishes cost efficiency (tiering beats all-Pro); it says nothing about whether the underlying design choice — routing multi-hop queries to Pro — produces meaningfully better answers than routing everything to Flash would have. That's a different, unmeasured question, in the same category as the correctness-vs-gold metric this document has deferred since the baseline failure analysis.
+ 
+**Caveats already carried from the distribution/stability findings above still apply:** n=16 is small; this is a single capture run, not repeated across multiple runs the way the tier-classification boundary queries (q002/q003/q013) were verified stable; and the pricing itself is Developer API, not confirmed against actual Vertex billing.
+ 
