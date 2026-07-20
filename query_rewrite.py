@@ -120,19 +120,32 @@ def retrieve_with_rewrite(
     n_results: int,
     corpus: str | None = None,
     throttle_fn=None,
+    return_subquery_pools: bool = False,
 ) -> dict:
     """
     Orchestrator — rewrite_query() -> per-sub-query retrieval -> guaranteed-
     slot merge. Same return contract as ThreatIntelDB.semantic_search().
 
+    return_subquery_pools: if True, ALSO includes "subquery_pools" in the
+    return dict — list of {"sub_query_text": str, "candidates": [(meta,
+    doc), ...]}, one entry per sub-query, RAW (not deduped, not merged).
+    Purely additive: the existing "documents"/"metadatas"/"distances"
+    merge below is computed and returned exactly as before regardless of
+    this flag, so every existing caller is byte-identical. This exists
+    because retrieval_pipeline.py's reranked merge needs each sub-query's
+    OWN candidates scored against ITS OWN sub-query text — by the time
+    this function's own merge collapses everything below, that
+    association is gone.
+
     NOTE: each sub-query fetches exactly n_results candidates (not a widened
     pool). Pool-widening (fetching more than n_results per sub-query so a
     lower-ranked correct answer has a chance to surface during merge) was
     investigated as a possible additional fix for q015/q016 but found
-    insufficient on its own (confirmed: T1190 sat at rank 13/15 even with
-    canonical MITRE phrasing) and was NOT adopted — those two residual
-    misses are tracked as a documented limitation instead of solved here.
-    Do not silently widen this without re-opening that scope decision.
+    insufficient on its own WITHOUT a reranker (confirmed: T1190 sat at
+    rank 13/15 even with canonical MITRE phrasing). As of the merge+rerank
+    architecture, retrieval_pipeline.py calls this with n_results already
+    set to config.RERANK_POOL_K (widened) — that decision lives in the
+    caller, not here; this function's own default behavior is unchanged.
 
     Corpus resolution per sub-query:
       - Caller passed an explicit corpus ("mitre"/"kev" — single-corpus
@@ -150,7 +163,10 @@ def retrieve_with_rewrite(
       at a lower absolute distance than a correct MITRE match). Pure
       global top-K by distance can let one sub-query's results crowd out
       another's correct answer entirely. Guaranteeing each sub-query's own
-      best result a seat first prevents that starvation.
+      best result a seat first prevents that starvation. This function's
+      OWN merge below still exists and is still returned — it's just no
+      longer what retrieval_pipeline.py's production path actually uses
+      when return_subquery_pools=True; see that module for why.
     """
     sub_queries = rewrite_query(query, client, throttle_fn=throttle_fn)
 
@@ -169,7 +185,10 @@ def retrieve_with_rewrite(
         per_subquery_results.append(ranked_sq)
 
     if not any(per_subquery_results):
-        return {"documents": [[]], "metadatas": [[]], "distances": [[]], "error": None}
+        empty = {"documents": [[]], "metadatas": [[]], "distances": [[]], "error": None}
+        if return_subquery_pools:
+            empty["subquery_pools"] = []
+        return empty
 
     # Guarantee slot 1: best result from EACH sub-query, deduped by technique_id
     seen: set[str] = set()
@@ -200,9 +219,18 @@ def retrieve_with_rewrite(
             final.append((dist, meta, doc))
 
     final = final[:n_results]
-    return {
+    out = {
         "documents": [[d for _, _, d in final]],
         "metadatas": [[m for _, m, _ in final]],
         "distances": [[dist for dist, _, _ in final]],
         "error": None,
     }
+    if return_subquery_pools:
+        out["subquery_pools"] = [
+            {
+                "sub_query_text": sq.text,
+                "candidates": [(meta, doc) for _, meta, doc in ranked_sq],
+            }
+            for sq, ranked_sq in zip(sub_queries, per_subquery_results)
+        ]
+    return out
