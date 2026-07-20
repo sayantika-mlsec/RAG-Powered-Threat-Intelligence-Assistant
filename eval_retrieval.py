@@ -9,13 +9,10 @@ from collections import defaultdict
 from pathlib import Path
 from dotenv import load_dotenv
 
-# Load .env BEFORE importing config. config.py reads GCP_PROJECT_ID /
-# GCP_LOCATION at import time (module-level), so if load_dotenv only ran
-# later — conditionally, inside __main__, only for the routed arm, as it did
-# before this migration — plain `import config` could fail before a single
-# line of this script's logic runs, even for the blind arm that needs no
-# Gemini calls at all. Loading here, unconditionally, first, removes that
-# hidden ordering dependency entirely.
+# Load .env BEFORE importing config — see original note: config.py reads
+# GCP_PROJECT_ID / GCP_LOCATION at import time, so this must run first,
+# unconditionally, for every arm (including the blind arm, which makes no
+# Gemini calls but still imports config).
 load_dotenv(dotenv_path=Path(__file__).parent / ".env", override=True)
 
 from ingest import ThreatIntelDB
@@ -32,28 +29,23 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 # ─── Pinned Baseline ──────────────────────────────────────────────────────────
-# The retrieval baseline (precision 0.2444 / recall 0.5667) was captured at K=3.
-# The per-row `eligible` flag and recall@K only mean what the downstream
-# faithfulness gate expects if K matches this pin. Real if/raise, NOT assert.
 PINNED_BASELINE_K = 3
 
-# Throttle between ANY live Gemini call — routing AND rewrite-fallback calls
-# both share this. Blind arm makes NO API calls — semantic_search is local
-# ChromaDB — so it never throttles.
+# Throttle between ANY live Gemini call — routing AND rewrite calls both
+# share this. Blind arm makes NO API calls — semantic_search is local
+# ChromaDB — so it never throttles. NOTE: post-gate-removal, EVERY
+# non-exact-match query in the fixes arm now makes a rewrite call
+# (previously the gate skipped rewrite ~3/13 times) — throttling matters
+# slightly more than before, not less.
 THROTTLE_SECONDS = 6
 
-# Corpus tag values used throughout the project (exact_id.py, app.py's
-# _route_to_corpus, retrieve_for_route). Named here once so the corpus-stamp
-# reconciliation below isn't hardcoding string literals independently of the
-# rest of the codebase's usage.
 CORPUS_TAGS = ("mitre", "kev")
 
 
 def _route_to_corpus(route: Route) -> str | None:
     """Map a Route to the `corpus` arg for semantic_search. SKIP is handled by
     the caller (no retrieval), so it is not mapped here — an unmapped route
-    raises rather than silently defaulting to whole-store (which would corrupt
-    the A/B by reintroducing blind retrieval)."""
+    raises rather than silently defaulting to whole-store."""
     if route == Route.MITRE_ONLY:
         return "mitre"
     if route == Route.KEV_ONLY:
@@ -65,19 +57,8 @@ def _route_to_corpus(route: Route) -> str | None:
 
 def _corpus_stamp(db: ThreatIntelDB) -> dict:
     """
-    Read the collection's chunk counts for the corpus stamp — PER CORPUS, not
-    just a combined total. A single combined count can hide an imbalance: e.g.
-    500 mitre + 1640 kev also sums to 2140, same as the expected 540 + 1600.
-    Per-corpus counts, reconciled against the combined total, turn that
-    silent-hiding failure mode into a fail-loud check instead.
-
-    include=[] on the per-corpus get() calls: only `ids` are needed to count,
-    so documents/metadatas are skipped rather than pulled and discarded.
-
-    Returns {"collection_name", "chunk_count_total", "chunk_count_mitre",
-    "chunk_count_kev"}. Raises RuntimeError if the two corpus counts don't
-    sum to the total — a chunk is then untagged, mistagged, or tagged with a
-    third corpus value not accounted for anywhere else in this project.
+    Read the collection's chunk counts for the corpus stamp — PER CORPUS,
+    reconciled against the combined total. Unchanged by this session's work.
     """
     try:
         collection_name = db.collection.name
@@ -119,67 +100,57 @@ def run_evaluation(
     *,
     use_routing: bool = False,
     use_retrieval_fixes: bool = False,
-    use_confidence_gate: bool = False,
     router_client=None,
 ):
     """
     Evaluate the RAG retrieval with Precision@K and Recall@K, emit a per-row
     metrics artifact (recall@K + eligibility + route) to the active MLflow run.
 
-    TWO INDEPENDENT AXES — not one "ONLY A/B variable" as in the prior version:
+    TWO AXES (was three — the confidence-gate axis is retired, see
+    retrieval_pipeline.py module docstring):
 
         use_routing         -> corpus selection. False = blind whole-store
                                 semantic_search (reproduces precision 0.2444 /
                                 recall 0.5667). True = agentic route_query
                                 decides the corpus, retrieval filtered to it.
 
-        use_retrieval_fixes -> exact-match ID lookup + corpus-tagged query
-                                rewrite + guaranteed-slot cross-corpus merge,
-                                applied WITHIN the routed arm's retrieval step.
-                                Requires use_routing=True — the fixes operate
-                                on route decisions and are meaningless without
-                                them.
+        use_retrieval_fixes -> exact-match ID lookup + widened dense search
+                                + rewrite/decomposition, BOTH run
+                                unconditionally, merged, deduped, and
+                                reranked once. Requires use_routing=True.
 
-        use_confidence_gate -> fallback-only rewrite restructuring (Jul 14
-                                session). Within retrieve_for_route(), try
-                                dense search first; only fall through to the
-                                unstable rewrite step if the top-1 distance
-                                misses the calibrated confidence threshold.
-                                Requires use_retrieval_fixes=True — there's
-                                nothing to gate without the fixes arm's
-                                exact-match/rewrite retrieval path.
+    *** REDEFINITION NOTICE *** — use_retrieval_fixes=True now means
+    something DIFFERENT from every MLflow run logged under this arm tag
+    before this change. Previously (no gate): exact-match, then rewrite
+    ONLY, unconditionally — dense search was never consulted except via the
+    gate's now-removed dense_confident branch. NOW: exact-match, then dense
+    (widened to RERANK_POOL_K) AND rewrite BOTH run, merged, reranked. These
+    are genuinely different retrieval mechanisms sharing one flag name.
+    RESOLVED: future runs are tagged arm="routed_with_fixes_reranked" (not
+    "routed_with_fixes") — see __main__ below — so past and future runs
+    aren't silently conflated under identical MLflow tags, same lineage-
+    integrity concern RECALL_BASELINE_RUN_ID exists to protect elsewhere in
+    this project. Any run still tagged "routed_with_fixes" predates this
+    change and used the old (no-dense-fallback) mechanism.
 
-    Four valid arms:
-        blind:                use_routing=False, use_retrieval_fixes=False
-                               (unaffected by this issue's work — no API calls)
-        routed:               use_routing=True,  use_retrieval_fixes=False
-                               (existing agentic-routing baseline)
-        routed_with_fixes:    use_routing=True,  use_retrieval_fixes=True,
-                               use_confidence_gate=False
-                               (exact-match/rewrite/merge fixes, rewrite runs
-                               unconditionally on every non-ID query)
-        routed_with_fixes_gated: use_routing=True, use_retrieval_fixes=True,
-                               use_confidence_gate=True
-                               (same fixes, rewrite only on low dense-search
-                               confidence — this is what's being A/B'd against
-                               routed_with_fixes to confirm q001/q004 stop
-                               regressing without losing q007/q015/q016's
-                               rewrite-rescues)
+    Three valid arms (was four — routed_with_fixes_gated no longer exists):
+        blind:                       use_routing=False, use_retrieval_fixes=False
+        routed:                      use_routing=True,  use_retrieval_fixes=False
+        routed_with_fixes_reranked:  use_routing=True,  use_retrieval_fixes=True
+                                      (see redefinition notice above)
 
     A scored row wrongly routed to skip retrieves NOTHING (recall 0) — the
     misroute is penalised, not hidden, regardless of use_retrieval_fixes.
 
     Gating (route-based, three-way — restraint vs misroute vs normal):
-        - gated-out = rows with NO expected IDs (nothing to retrieve; correct
-                      behavior is no-retrieval). Never scored, either arm.
-        - scored    = rows WITH expected IDs. A skip-route here is a misroute →
-                      empty retrieval → recall 0.
+        - gated-out = rows with NO expected IDs. Never scored, either arm.
+        - scored    = rows WITH expected IDs. A skip-route here is a misroute
+                      -> empty retrieval -> recall 0.
         Reconciliation invariant: len(scored) + len(gated_out) == total.
 
     Returns {"precision_overall": float, "recall_overall": float} on a completed
     run, or None if evaluation did not run.
     """
-    # ── Guard: K must match the pinned baseline ──
     if K != PINNED_BASELINE_K:
         raise ValueError(
             f"K={K} does not match the pinned baseline K={PINNED_BASELINE_K}. "
@@ -194,16 +165,9 @@ def run_evaluation(
     if use_retrieval_fixes and not use_routing:
         raise ValueError(
             "use_retrieval_fixes=True requires use_routing=True — the fixes "
-            "(exact-match, rewrite, merge) operate on route decisions and "
-            "have no defined behavior against blind whole-store retrieval."
-        )
-
-    if use_confidence_gate and not use_retrieval_fixes:
-        raise ValueError(
-            "use_confidence_gate=True requires use_retrieval_fixes=True — "
-            "the gate decides whether retrieve_for_route() falls through to "
-            "rewrite; it has nothing to gate without the fixes arm's "
-            "retrieval path."
+            "(exact-match, dense+rewrite merge, rerank) operate on route "
+            "decisions and have no defined behavior against blind "
+            "whole-store retrieval."
         )
 
     # 1. Load the ground-truth dataset
@@ -216,17 +180,12 @@ def run_evaluation(
 
     total = len(all_queries)
 
-    # 2. Partition: scored (has expected IDs) vs gated-out (nothing to retrieve).
-    #    Route-based misrouting is measured WITHIN scored, not by moving rows
-    #    between these two groups — so reconciliation stays keyed off the data.
     def _has_expected(q):
         return len(q.get('expected_technique_ids', [])) > 0 or len(q.get('expected_cve_ids', [])) > 0
 
     scored_queries = [q for q in all_queries if _has_expected(q)]
     gated_out      = [q for q in all_queries if not _has_expected(q)]
 
-    # Reconcile the partition BEFORE any work — a mismatch means a row fell
-    # through both predicates (malformed row) and the denominator is wrong.
     if len(scored_queries) + len(gated_out) != total:
         raise RuntimeError(
             f"Partition failed: {len(scored_queries)} scored + {len(gated_out)} "
@@ -237,13 +196,7 @@ def run_evaluation(
         logger.warning("No scored queries (all rows gated out). Nothing to evaluate.")
         return None
 
-    # 3. Initialize ChromaDB Connection
     db = ThreatIntelDB()
-
-    # ─── Corpus Stamp Extraction ───
-    # Per-corpus counts (mitre / kev), reconciled against the combined total.
-    # See _corpus_stamp() docstring: a combined-only count can hide an
-    # imbalance a per-corpus split + reconciliation check cannot.
     corpus_stamp = _corpus_stamp(db)
 
     metrics_tracker = defaultdict(lambda: {"precision_sum": 0.0, "recall_sum": 0.0, "count": 0})
@@ -252,7 +205,7 @@ def run_evaluation(
     logger.info(
         f"Evaluating {len(scored_queries)} scored queries at K={K} "
         f"(use_routing={use_routing}, use_retrieval_fixes={use_retrieval_fixes}, "
-        f"use_confidence_gate={use_confidence_gate}, {len(gated_out)} gated out)..."
+        f"{len(gated_out)} gated out)..."
     )
     logger.info(
         f"Corpus stamp: total={corpus_stamp['chunk_count_total']}, "
@@ -263,7 +216,7 @@ def run_evaluation(
     global_precision_sum = 0.0
     global_recall_sum = 0.0
     global_count = 0
-    misroute_ids = []   # scored rows the router sent to skip — routing failures
+    misroute_ids = []
 
     mlflow.log_metric("eval_dataset_size", len(scored_queries))
     mlflow.log_metric("n_gated_out", len(gated_out))
@@ -275,9 +228,6 @@ def run_evaluation(
     made_live_call = False
 
     def _throttle():
-        """Guards ANY live Gemini call — routing AND rewrite-fallback calls
-        both funnel through this, so the gap is enforced regardless of which
-        call triggers it or how many happen per row."""
         nonlocal made_live_call
         if made_live_call:
             time.sleep(THROTTLE_SECONDS)
@@ -288,11 +238,6 @@ def run_evaluation(
         expected_ids = set(query_row['expected_technique_ids']) | set(query_row['expected_cve_ids'])
 
         route_value = None
-        # None on: blind arm, plain-routed arm (no fixes), and any row this
-        # iteration doesn't reach a fixes/gate branch for. Set explicitly in
-        # each branch below rather than derived from `results` after the
-        # fact — `results` is NOT reassigned on the SKIP branch, so reading
-        # it there would silently reuse a stale value from a prior row.
         retrieval_path = None
 
         if use_routing:
@@ -301,8 +246,6 @@ def run_evaluation(
             route_value = decision.route.value
 
             if decision.route == Route.SKIP:
-                # Misroute: a real query (has expected IDs) wrongly skipped.
-                # Retrieval is empty → recall 0. Penalised, not hidden.
                 retrieved_ids = []
                 retrieval_path = "skip_misroute"
                 misroute_ids.append(query_row.get('id'))
@@ -316,7 +259,6 @@ def run_evaluation(
                     results = retrieve_for_route(
                         db, query_row['query'], router_client, K, corpus,
                         throttle_fn=_throttle,
-                        use_confidence_gate=use_confidence_gate,
                     )
                 else:
                     results = db.semantic_search(query_row['query'], n_results=K, corpus=corpus)
@@ -326,14 +268,12 @@ def run_evaluation(
                     continue
                 retrieved_ids = [m['technique_id'] for m in results['metadatas'][0]]
                 if use_retrieval_fixes:
-                    # retrieve_for_route() must set results["path"] to one of
-                    # "exact_match" / "dense_confident" / "rewrite" for this
-                    # to be meaningful — see retrieval_pipeline.py dependency
-                    # note below.
+                    # retrieve_for_route() sets results["path"] to
+                    # "exact_match" or "merged_reranked" — the old
+                    # "dense_confident" value no longer exists.
                     retrieval_path = results.get("path", "unknown")
         else:
-            # Blind baseline — whole store, no filter, no API call.
-            # UNCHANGED — never touches retrieve_for_route or use_retrieval_fixes.
+            # Blind baseline — whole store, no filter, no API call. Unchanged.
             results = db.semantic_search(query_row['query'], n_results=K)
             if results.get("error"):
                 logger.error(f"Search failed: {query_row['query'][:40]}... {results['error']}")
@@ -353,8 +293,8 @@ def run_evaluation(
             "id": row_id,
             f"recall_at_{K}": recall,
             "eligible": recall > 0,
-            "route": route_value,   # None on the blind arm
-            "retrieval_path": retrieval_path,  # None unless use_retrieval_fixes
+            "route": route_value,
+            "retrieval_path": retrieval_path,
             "retrieved_ids": retrieved_ids,
             "expected_ids": sorted(expected_ids),
         })
@@ -399,15 +339,12 @@ def run_evaluation(
         path_counts = dict(path_counts)
         for path_name, count in sorted(path_counts.items()):
             mlflow.log_metric(f"n_path_{path_name}", count)
-        n_rewrite = path_counts.get("rewrite", 0)
+        n_merged = path_counts.get("merged_reranked", 0)
         logger.info(
             f"Retrieval path distribution: {path_counts} "
-            f"({n_rewrite}/{len(per_row_records)} queries touched rewrite)"
+            f"({n_merged}/{len(per_row_records)} queries went through merge+rerank)"
         )
 
-    # ── Per-row detail — printed directly, not just in the MLflow artifact,
-    # so a single run's mismatches are visible immediately without a
-    # separate pull/diff step. ──
     print(f"\n{'Per-Row Detail':<8} | {'Recall':<7} | {'Retrieved':<40} | Expected")
     print("-" * 100)
     for r in per_row_records:
@@ -425,7 +362,6 @@ def run_evaluation(
             f"Reconciliation FAILED: per-row recall sum ({per_row_recall_sum}) "
             f"!= global recall sum ({global_recall_sum})."
         )
-    # Row-count reconciliation: scored rows evaluated + gated == total.
     if len(per_row_records) + len(gated_out) != total:
         raise AssertionError(
             f"Row reconciliation FAILED: {len(per_row_records)} scored + "
@@ -437,17 +373,14 @@ def run_evaluation(
     artifact_payload = {
         "use_routing": use_routing,
         "use_retrieval_fixes": use_retrieval_fixes,
-        "use_confidence_gate": use_confidence_gate,
         "retrieval_path_counts": path_counts,
         "corpus_stamp": {
             **corpus_stamp,
             "note": (
                 "Per-corpus counts (mitre/kev), reconciled against the "
-                "combined total at read time — a chunk untagged, mistagged, "
-                "or tagged outside {mitre, kev} would have raised before "
-                "this artifact was written. Content-only edits at constant "
-                "per-corpus count are NOT detected; corpus version is "
-                "guaranteed by run lineage."
+                "combined total at read time. Content-only edits at "
+                "constant per-corpus count are NOT detected; corpus "
+                "version is guaranteed by run lineage."
             ),
         },
         "k_value": K,
@@ -479,35 +412,29 @@ if __name__ == "__main__":
     ap.add_argument("--use-routing", action="store_true",
                     help="agentic arm. Omit for the blind baseline.")
     ap.add_argument("--use-retrieval-fixes", action="store_true",
-                    help="Requires --use-routing. Applies exact-match ID lookup "
-                         "+ corpus-tagged rewrite + guaranteed-slot merge.")
-    ap.add_argument("--use-confidence-gate", action="store_true",
-                    help="Requires --use-retrieval-fixes. Gates the rewrite "
-                         "fallback on dense-search top-1 confidence instead "
-                         "of always rewriting.")
+                    help="Requires --use-routing. Exact-match + widened "
+                         "dense + rewrite, merged and reranked.")
     args = ap.parse_args()
 
     if args.use_retrieval_fixes and not args.use_routing:
         ap.error("--use-retrieval-fixes requires --use-routing")
-    if args.use_confidence_gate and not args.use_retrieval_fixes:
-        ap.error("--use-confidence-gate requires --use-retrieval-fixes")
 
     client = None
     if args.use_routing:
-        # One shared client, Vertex-backed — no API key, no separate SDK
-        # config here. Auth and quota now live with gcloud ADC + the GCP
-        # project, not a per-file `genai.Client(api_key=...)` call.
         from gemini_client import get_client
         client = get_client()
 
     mlflow.set_experiment(config.MLFLOW_EXPERIMENT_NAME)
 
-    if args.use_confidence_gate:
-        run_name = "retrieval_eval_routed_fixed_gated"
-        arm_tag = "routed_with_fixes_gated"
-    elif args.use_retrieval_fixes:
-        run_name = "retrieval_eval_routed_fixed"
-        arm_tag = "routed_with_fixes"
+    if args.use_retrieval_fixes:
+        # Renamed from "routed_with_fixes" — that tag now means a
+        # structurally different retrieval mechanism (see REDEFINITION
+        # NOTICE in run_evaluation()'s docstring). New tag keeps past runs
+        # (exact-match + unconditional rewrite, no dense fallback) from
+        # being silently conflated with future runs (exact-match + widened
+        # dense + rewrite, merged and reranked) under one identical name.
+        run_name = "retrieval_eval_routed_fixed_reranked"
+        arm_tag = "routed_with_fixes_reranked"
     elif args.use_routing:
         run_name = "retrieval_eval_routed"
         arm_tag = "routed"
@@ -518,21 +445,17 @@ if __name__ == "__main__":
     with mlflow.start_run(run_name=run_name):
         mlflow.set_tag("arm", arm_tag)
 
-        # ── Config params — make the run self-describing / reproducible ──
         mlflow.log_param("use_routing",         args.use_routing)
         mlflow.log_param("use_retrieval_fixes", args.use_retrieval_fixes)
-        mlflow.log_param("use_confidence_gate", args.use_confidence_gate)
-        if args.use_confidence_gate:
-            # Reproducibility: the calibrated number this run's gate decisions
-            # actually used, not just the fact that gating was on.
-            mlflow.log_param("confidence_threshold", config.RETRIEVAL_CONFIDENCE_THRESHOLD)
+        if args.use_retrieval_fixes:
+            mlflow.log_param("rerank_model",    config.RERANK_MODEL)
+            mlflow.log_param("rerank_pool_k",   config.RERANK_POOL_K)
         mlflow.log_param("k",                   config.RETRIEVAL_TOP_K)
         mlflow.log_param("embedding_model",     config.EMBEDDING_MODEL)
         mlflow.log_param("chunk_size",          config.CHUNK_SIZE)
         mlflow.log_param("chunk_overlap",       config.CHUNK_OVERLAP)
         mlflow.log_param("max_chunk_chars",     config.MAX_CHUNK_CHARS)
         if args.use_routing:
-            # Router model lives in routing.py (_ROUTER_MODEL), not config.
             from routing import _ROUTER_MODEL
             mlflow.log_param("router_model", _ROUTER_MODEL)
 
@@ -540,6 +463,5 @@ if __name__ == "__main__":
             str(config.EVAL_SET_PATH),
             use_routing=args.use_routing,
             use_retrieval_fixes=args.use_retrieval_fixes,
-            use_confidence_gate=args.use_confidence_gate,
             router_client=client,
         )
