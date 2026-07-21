@@ -18,18 +18,15 @@ Routing:
     legacy google.generativeai) that used to exist here is gone; both were
     migrated off the shared AI-Studio free-tier pool onto Vertex.
 
-Gating (added):
-  - use_confidence_gate is a SECOND, independent flag, meaningful only when
-    use_routing=True. It swaps the routed branch's retrieval call from plain
-    DB.semantic_search to retrieve_for_route (exact-match -> gated dense ->
-    rewrite fallback) — the same function eval_retrieval.py already uses to
-    measure retrieval quality, now wired into the path that actually
-    generates answers.
-  - The BLIND arm (use_routing=False) and the existing ungated ROUTED arm
-    are both untouched byte-for-byte: use_confidence_gate=False still calls
-    DB.semantic_search exactly as before, so any already-captured
-    generation_capture.json / generation_capture_routed.json stay valid.
-    Gating only changes behavior when explicitly turned on.
+Retrieval (no gate):
+  - run_pipeline's routed branch always calls retrieve_for_route(), which
+    runs exact-match, then widened dense search + rewrite unconditionally,
+    merges, dedupes, and reranks once. The confidence gate that used to sit
+    between "trust dense search" and "fall through to rewrite" is retired —
+    see retrieval_pipeline.py's module docstring for why.
+  - The BLIND arm (use_routing=False) is untouched byte-for-byte by any of
+    this: it still calls DB.semantic_search directly, so any
+    already-captured generation_capture.json stays valid.
 """
 
 import os
@@ -478,71 +475,44 @@ def run_pipeline(
     *,
     use_routing: bool,
     n_results: int = N_RESULTS,
-    use_confidence_gate: bool = False,
 ) -> tuple[AnalysisResult, dict, str | None, str | None]:
     """
     Full RAG pipeline — the single entry point shared by the Gradio UI and the
-    eval harness. `use_routing` is the primary A/B variable, which is what
-    keeps Friday's original A/B single-variable:
+    eval harness.
 
         use_routing=False -> query the whole store (byte-identical to the
                              pre-routing baseline: precision 0.2444 / recall 0.5667)
-        use_routing=True  -> route_query decides the corpus, then retrieval is
-                             filtered to it
-
-    `use_confidence_gate` is a SECOND, independent flag, meaningful only when
-    use_routing=True:
-
-        use_confidence_gate=False -> routed branch calls DB.semantic_search
-                                      directly, exactly as before. Untouched.
-        use_confidence_gate=True  -> routed branch calls retrieve_for_route
-                                      instead (exact-match -> gated dense ->
-                                      rewrite fallback) — the same mechanism
-                                      already measured in eval_retrieval.py,
-                                      now producing the context an actual
-                                      answer is generated against.
-
-    Raises ValueError if use_confidence_gate=True with use_routing=False —
-    gating has no meaning without a route to gate within. Fail loud rather
-    than silently ignoring the flag.
+        use_routing=True  -> route_query decides the corpus, then retrieval
+                             goes through retrieve_for_route() — exact-match,
+                             then widened dense search + rewrite merged and
+                             reranked once. No confidence gate: that axis is
+                             retired (see retrieval_pipeline.py). The routed
+                             arm now always gets the full fixes pipeline;
+                             there is no "routed but ungated/unfixed" mode
+                             in the live app (that comparison still exists
+                             in eval_retrieval.py, for A/B measurement).
 
     Returns (result, search_results, route_value, tier_value):
         result         : AnalysisResult from the generation layer
-        search_results : the raw dict from semantic_search / retrieve_for_route
-                         (same documents/metadatas shape either way, so
-                         downstream citation/status formatting is unchanged)
-        route_value    : the route string when routing ran, else None — for
-                         logging and eval attribution
+        search_results : the raw dict from semantic_search / retrieve_for_route.
+                         NOTE: on the routed path, search_results["distances"]
+                         now holds CROSS-ENCODER SCORES (higher = more
+                         relevant), not cosine distance (lower = more
+                         similar) — see retrieve_for_route()'s docstring.
+                         Confirmed threat_analyzer.py does NOT read this
+                         field, so this is safe as of the files reviewed.
+        route_value    : the route string when routing ran, else None
         tier_value     : the tier string ('flash'/'pro') when routing ran,
-                         else None. Added for Jul 25's tagged eval — previously
-                         computed internally but not surfaced past this
-                         function; generation_capture.py needs it on every
-                         record to tag cost/latency by tier downstream. This
-                         IS a breaking change to this function's return arity
-                         (3-tuple -> 4-tuple): every positional caller —
-                         handle_query() below, and generation_capture.py —
-                         is updated in this same change.
+                         else None
 
     Tier dispatch: when routing runs, decision.tier is threaded into
-    ANALYZER.generate_answer so generation itself dispatches to Flash or Pro
-    per-query. The blind arm never computes a decision, so it passes
-    tier=None -> generate_answer defaults to FLASH, the same model it always
-    used — the blind baseline's model choice is unchanged.
+    ANALYZER.generate_answer so generation dispatches to Flash or Pro
+    per-query. The blind arm passes tier=None -> defaults to FLASH.
 
-    The skip route returns a direct no-retrieval response (mode='no_retrieval'),
-    a clean success distinct from a failure. Nothing touches ChromaDB on that
-    path, and the gate never runs on it. Tier is also moot there —
-    route_query() already forces tier=FLASH on skip, and _no_retrieval_response
-    always generates on _ROUTER_MODEL directly, consistent with that — but the
-    forced 'flash' value is still returned as tier_value, not None, since a
-    routing decision genuinely was made on this path.
+    The skip route returns a direct no-retrieval response (mode='no_retrieval').
+    Nothing touches ChromaDB on that path, and the gate never applied there
+    even before this change — moot now regardless.
     """
-    if use_confidence_gate and not use_routing:
-        raise ValueError(
-            "use_confidence_gate=True requires use_routing=True — "
-            "the gate has no meaning without a route to gate within."
-        )
-
     empty_results = {"documents": [[]], "metadatas": [[]], "error": None}
     route_value: str | None = None
     tier_value: str | None = None
@@ -579,29 +549,23 @@ def run_pipeline(
                 tier_value,
             )
 
-        if use_confidence_gate:
-            # Gated path: exact-match -> gated dense -> rewrite fallback.
-            # Same function eval_retrieval.py uses to measure retrieval —
-            # now the source of context an answer actually gets generated
-            # against. throttle_fn=None here: run_pipeline serves single
-            # interactive queries (UI) or is called row-by-row by capture
-            # scripts that already throttle between rows themselves: a
-            # second throttle inside retrieve_for_route's own rewrite call
-            # would double up spacing that's already enforced one level up.
-            search_results = retrieve_for_route(
-                DB, query, ROUTER_CLIENT,
-                k=n_results, corpus=corpus,
-                throttle_fn=None,
-                use_confidence_gate=True,
-            )
-        else:
-            # Unchanged — plain corpus-filtered search, exactly as before
-            # gating existed. Any already-captured routed artifact stays valid.
-            search_results = DB.semantic_search(query, n_results=n_results, corpus=corpus)
+        # Always the full pipeline now — exact-match -> widened dense search
+        # + rewrite -> merge/dedupe -> rerank once. The confidence gate that
+        # used to sit here (dense-confident vs. rewrite-fallback) is retired
+        # — see retrieval_pipeline.py's module docstring. throttle_fn=None:
+        # this function serves single interactive queries (UI) or is called
+        # row-by-row by capture scripts that already throttle between rows
+        # themselves — a second throttle inside retrieve_for_route's own
+        # rewrite call would double up spacing already enforced one level up.
+        search_results = retrieve_for_route(
+            DB, query, ROUTER_CLIENT,
+            k=n_results, corpus=corpus,
+            throttle_fn=None,
+        )
     else:
-        # Blind baseline — no filter, whole store. Gate never applies here
-        # (guarded above), so this branch is untouched. No routing decision
-        # exists on this branch, so no tier either.
+        # Blind baseline — no filter, whole store. Untouched by any of this
+        # session's work — no routing decision exists on this branch, so no
+        # tier either.
         search_results = DB.semantic_search(query, n_results=n_results)
 
     # decision is only assigned when use_routing=True, and every
