@@ -4,28 +4,39 @@
 # this and makes zero retrieval or generation calls — guaranteeing the judged
 # context matches the context behind each answer.
 #
-# A/B CHANGE: capture now drives app.run_pipeline instead of calling
+# A/B CHANGE: capture drives app.run_pipeline instead of calling
 # semantic_search + generate_answer directly. use_routing is the primary
 # variable between the blind and routed arms, so both are byte-identical
 # except the flag — the single-variable discipline the whole routing branch
 # exists to preserve.
 #
+# ARM COLLAPSE (2026-07-22, confirmed against app.py's current run_pipeline):
+# run_pipeline() no longer accepts use_confidence_gate at all — the confidence
+# gate's retirement removed the three-arm model this script used to support.
+# use_routing=True now ALWAYS runs the full retrieve_for_route() pipeline
+# (exact-match -> merge/rerank -> fragmentation resolution); there is no more
+# "routed but plain semantic_search" mode in the live app. Per run_pipeline's
+# own docstring: that comparison still exists in eval_retrieval.py for A/B
+# measurement, but not here.
+#
+# So there are only TWO arms now, not three:
 #     use_routing=False -> blind baseline (whole store) -> generation_capture.json
-#     use_routing=True  -> agentic (route decides corpus) -> generation_capture_routed.json
+#     use_routing=True  -> full current pipeline          -> generation_capture_routed.json
 #
-# GATED ARM (added): use_confidence_gate is a second, independent flag, valid
-# only alongside use_routing=True. It swaps run_pipeline's routed retrieval
-# call from plain semantic_search to retrieve_for_route (exact-match -> gated
-# dense -> rewrite fallback) — the same mechanism eval_retrieval.py already
-# measures in isolation, now producing the context real answers are generated
-# against.
+# ⚠️ STALENESS WARNING, not just a naming issue: if generation_capture_routed.json
+# already exists locally from BEFORE this collapse, its rows were captured via
+# plain semantic_search (the old "routed but ungated" behavior) — a code path
+# run_pipeline can no longer produce. REQUIRED_ROW_KEYS will NOT catch this,
+# because the schema is unchanged; only which function produced the rows
+# changed. _load_existing() would silently reuse those old rows as if they
+# came from the current pipeline. Same risk generation_capture_gated.json had
+# — treat any pre-existing generation_capture_routed.json as suspect and
+# capture fresh via --out-path rather than trusting the default filename,
+# same as was done for the gated arm's stale file this session.
 #
-#     use_routing=True, use_confidence_gate=True -> generation_capture_gated.json
-#
-# The blind arm and the existing ungated routed arm are untouched by this
-# change — run_pipeline only takes the gated path when use_confidence_gate is
-# explicitly passed, so any already-captured generation_capture.json /
-# generation_capture_routed.json remain valid and do not need re-running.
+# The blind arm alone is genuinely untouched by any of this — it never called
+# retrieve_for_route() before or after the gate's retirement, so
+# generation_capture.json remains valid without re-running.
 #
 # Scope: capture records ALL rows, including ineligible ones AND skip-routed ones.
 # The eligibility gate (recall@3 > 0) and the skip gate both live DOWNSTREAM
@@ -58,11 +69,12 @@ load_dotenv(dotenv_path=Path(__file__).parent / ".env", override=True)
 # run_pipeline is the single shared entry point (same function the Gradio UI
 # calls). Importing it triggers app.py's module-load init of DB / ANALYZER /
 # ROUTER_CLIENT, so we do NOT instantiate our own here — capture and the live
-# app run through byte-identical retrieval + generation + routing (+ gating)
-# code.
-# run_pipeline now accepts n_results and use_confidence_gate; capture pins
-# n_results to config.RETRIEVAL_TOP_K (k=3) so all arms match the pinned
-# baseline capture (which used k=3), not the live UI default of N_RESULTS=5.
+# app run through byte-identical retrieval + generation + routing code.
+# run_pipeline's signature, as of the gate's retirement, is
+# (query, *, use_routing, n_results=N_RESULTS) — NO use_confidence_gate
+# parameter. Capture pins n_results to config.RETRIEVAL_TOP_K (k=3) so all
+# arms match the pinned baseline capture (which used k=3), not the live UI
+# default of N_RESULTS=5.
 from app import run_pipeline
 import config
 
@@ -72,15 +84,32 @@ import config
 # left as-is until the actual Vertex quota ceiling is confirmed in the Cloud
 # Console. Lower it later, deliberately, not by accident.
 #
-# NOTE — gated arm makes up to 3 live calls per row when the gate falls
-# through to rewrite (route decision, then rewrite's own LLM call inside
-# retrieve_for_route, then generation), vs. 2 for the ungated routed arm.
+# NOTE — the routed arm makes up to 3 live calls per row when retrieval falls
+# through to the rewrite step inside retrieve_for_route() (route decision,
+# then rewrite's own LLM call, then generation), vs. 1 for the blind arm.
 # THROTTLE_SECONDS is only enforced BETWEEN rows here, not between the calls
 # within a single row — retrieve_for_route's rewrite step accepts a
 # throttle_fn of its own, left as None from run_pipeline (see app.py). If
-# rate-limit errors show up on the gated arm specifically, that's the spot to
+# rate-limit errors show up on the routed arm specifically, that's the spot to
 # add spacing, not here.
 THROTTLE_SECONDS = 6
+
+# Manually-set stamp identifying which version of retrieve_for_route() this
+# capture ran against. Not automated versioning — bump by hand whenever
+# retrieval logic changes materially (a new merge/rerank revision, a new
+# scoring-level fix, etc.), so a cached row's provenance is visible without
+# reverse-engineering git history or re-deriving it from timestamps. Written
+# on every row this script produces, including blind-arm rows, even though
+# the blind arm bypasses retrieve_for_route() entirely — kept for schema
+# uniformity across both arms' output files.
+#
+# Deliberately NOT added to REQUIRED_ROW_KEYS below: doing so would force a
+# full regen of the blind arm's artifact too, even though the blind arm's
+# underlying retrieval logic (plain semantic_search) didn't change with this
+# fix. That would be wasted API spend for zero signal. Staleness on the
+# routed arm specifically is handled by writing to a new --out-path rather
+# than by this check reusing/rejecting rows.
+RETRIEVAL_SNAPSHOT = "fragmentation_fix_2026-07-21"
 
 logging.basicConfig(
     level=logging.INFO,
@@ -94,16 +123,16 @@ def capture_row(
     row_id: str,
     *,
     use_routing: bool,
-    use_confidence_gate: bool = False,
 ) -> dict:
     """
     Retrieve + generate for one eval row via run_pipeline. Records the answer and
     the post-truncation context the LLM actually saw (result.context_used), plus
     the route taken and the result mode — both needed for downstream gating.
 
-    use_confidence_gate is forwarded straight through to run_pipeline, which
-    itself raises if use_confidence_gate=True with use_routing=False — no
-    duplicate validation needed here.
+    NOTE: run_pipeline no longer accepts a use_confidence_gate parameter (see
+    module docstring, ARM COLLAPSE) — when use_routing=True, it always runs
+    the full current retrieve_for_route() pipeline. Nothing to forward here
+    beyond use_routing itself.
 
     Three outcomes, all recorded (never dropped):
       - retrieved success : generation_ok=True, mode='retrieved', real context
@@ -114,7 +143,10 @@ def capture_row(
       - failure           : generation_ok=False, answer null, flagged
 
     `tier` is recorded on every row (None on the blind arm, same as `route`) —
-    this is what Jul 25's cost/latency-per-tier table groups by downstream.
+    this is what the cost/latency-per-tier table groups by downstream.
+
+    `retrieval_snapshot` is recorded on every row (see module-level constant,
+    above) — provenance marker, not used for any gating logic here.
 
     `latency_seconds`/`input_tokens`/`output_tokens`/`thinking_tokens` come
     straight from AnalysisResult (see threat_analyzer.py) — None on the
@@ -128,7 +160,6 @@ def capture_row(
         query,
         use_routing=use_routing,
         n_results=config.RETRIEVAL_TOP_K,
-        use_confidence_gate=use_confidence_gate,
     )
 
     usage_fields = {
@@ -151,6 +182,7 @@ def capture_row(
             "mode": getattr(result, "mode", "retrieved"),
             "route": route_value,                         # None on the blind arm
             "tier": tier_value,                            # None on the blind arm
+            "retrieval_snapshot": RETRIEVAL_SNAPSHOT,
             "generated_answer": result.answer,
             "retrieved_context": retrieved_context,       # post-truncation / empty on skip
             "citations": result.source_citations,
@@ -166,6 +198,7 @@ def capture_row(
         "mode": getattr(result, "mode", "retrieved"),
         "route": route_value,
         "tier": tier_value,
+        "retrieval_snapshot": RETRIEVAL_SNAPSHOT,
         "generated_answer": None,
         "retrieved_context": [],
         "citations": [],
@@ -180,6 +213,13 @@ def capture_row(
 # added. Keeping this explicit means a future field addition makes old rows
 # fail this check automatically, instead of relying on someone to remember
 # to delete stale artifacts by hand every time the schema grows.
+#
+# retrieval_snapshot is deliberately NOT included here — see the constant's
+# own comment, above, for why. NOTE: this check catches SCHEMA staleness
+# (missing fields) but NOT CODE-PATH staleness (same fields, produced by a
+# retired function) — see the module docstring's STALENESS WARNING regarding
+# any pre-existing generation_capture_routed.json from before the gate's
+# retirement. This check cannot and does not catch that case.
 REQUIRED_ROW_KEYS = {
     "id", "query", "generation_ok", "mode", "route", "tier",
     "generated_answer", "retrieved_context", "citations", "error",
@@ -246,7 +286,6 @@ def _write_artifact(
     out_path: str,
     records_by_id: dict,
     use_routing: bool,
-    use_confidence_gate: bool,
 ) -> None:
     """
     Persist current progress atomically. Writes to a temp file in the same
@@ -257,7 +296,7 @@ def _write_artifact(
     """
     artifact = {
         "use_routing": use_routing,
-        "use_confidence_gate": use_confidence_gate,
+        "retrieval_snapshot": RETRIEVAL_SNAPSHOT,
         "k_value": config.RETRIEVAL_TOP_K,
         "row_count": len(records_by_id),
         "rows": list(records_by_id.values()),
@@ -278,7 +317,6 @@ def run_capture(
     out_path: str,
     *,
     use_routing: bool,
-    use_confidence_gate: bool = False,
 ) -> None:
     """
     Capture every row in eval_set.json into a single JSON artifact for one arm.
@@ -319,7 +357,6 @@ def run_capture(
             record = capture_row(
                 row["query"], row_id,
                 use_routing=use_routing,
-                use_confidence_gate=use_confidence_gate,
             )
         except Exception as e:
             logger.error(f"Row {row_id} raised {e!r} — recording as failed, continuing.")
@@ -330,6 +367,7 @@ def run_capture(
                 "mode": None,
                 "route": None,
                 "tier": None,
+                "retrieval_snapshot": RETRIEVAL_SNAPSHOT,
                 "generated_answer": None,
                 "retrieved_context": [],
                 "citations": [],
@@ -349,7 +387,7 @@ def run_capture(
 
         # CHECKPOINT after every row. Worst case on a crash: you lose the one
         # row in flight, not the whole session's spend.
-        _write_artifact(out_path, records_by_id, use_routing, use_confidence_gate)
+        _write_artifact(out_path, records_by_id, use_routing)
 
     # Final integrity check — checked against what's actually on disk/in memory.
     missing = [row["id"] for row in eval_set if row["id"] not in records_by_id]
@@ -371,45 +409,45 @@ def run_capture(
 
 
 if __name__ == "__main__":
-    # Two flags pick the arm and its output file. Run up to three times for
-    # the full comparison:
-    #   python generation_capture.py                                    # blind baseline
-    #   python generation_capture.py --use-routing                      # agentic, ungated
-    #   python generation_capture.py --use-routing --use-confidence-gate # agentic, gated
+    # ONE flag now picks the arm (see module docstring, ARM COLLAPSE);
+    # --out-path overrides its default output filename explicitly.
+    #   python generation_capture.py                    # blind baseline
+    #   python generation_capture.py --use-routing       # full current pipeline
+    #
+    # --out-path example — capturing against a new retrieval snapshot without
+    # touching a prior arm's artifact from an older pipeline version:
+    #   python generation_capture.py --use-routing \
+    #       --out-path generation_capture_post_frag.json
     ap = argparse.ArgumentParser()
     ap.add_argument(
         "--use-routing",
         action="store_true",
-        help="agentic arm (route decides corpus). Omit for the blind baseline.",
+        help="full current pipeline — route_query() picks a corpus, then "
+             "retrieve_for_route() (exact-match -> merge/rerank -> "
+             "fragmentation resolution). Omit for the blind baseline.",
     )
     ap.add_argument(
-        "--use-confidence-gate",
-        action="store_true",
-        help="gated retrieval within the routed arm (exact-match -> gated dense "
-             "-> rewrite). Requires --use-routing.",
+        "--out-path",
+        default=None,
+        help="Override the default output filename for this arm. Useful when "
+             "capturing against a new retrieval snapshot without renaming or "
+             "overwriting a prior artifact from an older pipeline version.",
     )
     args = ap.parse_args()
 
-    if args.use_confidence_gate and not args.use_routing:
-        raise ValueError("--use-confidence-gate requires --use-routing.")
+    out_path = "generation_capture_routed.json" if args.use_routing else "generation_capture.json"
 
-    if args.use_confidence_gate:
-        out_path = "generation_capture_gated.json"
-    elif args.use_routing:
-        out_path = "generation_capture_routed.json"
-    else:
-        out_path = "generation_capture.json"
+    if args.out_path:      # explicit override wins over the flag-derived default
+        out_path = args.out_path
 
     logger.info(
-        f"Capture arm: use_routing={args.use_routing}, "
-        f"use_confidence_gate={args.use_confidence_gate} -> {out_path} "
-        f"(k={config.RETRIEVAL_TOP_K})"
+        f"Capture arm: use_routing={args.use_routing} -> {out_path} "
+        f"(k={config.RETRIEVAL_TOP_K}, retrieval_snapshot={RETRIEVAL_SNAPSHOT})"
     )
 
     run_capture(
         str(config.EVAL_SET_PATH), out_path,
         use_routing=args.use_routing,
-        use_confidence_gate=args.use_confidence_gate,
     )
 
     # MLflow is intentionally NOT used here. Capture produces no metrics — only

@@ -73,7 +73,12 @@ GENERATION_CONFIG = genai_types.GenerateContentConfig(
     #
     # NOTE: temperature=0.0 produces near-deterministic output but is NOT
     # guaranteed deterministic due to floating-point ops across GPU cores.
-    max_output_tokens=2048,
+    max_output_tokens=4096,    # was 2048 — q015 hit 2044/2048 (thinking 1966 +
+                               # output 78) and was cut off mid-sentence.
+                               # Doubling gives real headroom for compound
+                               # cross-corpus queries without touching
+                               # anything else — cost is governed by actual
+                               # usage, not this ceiling.
     candidate_count=1,
 )
 
@@ -219,7 +224,15 @@ def _safe_extract_text(response) -> tuple[str | None, str | None]:
     if finish_reason_name == "SAFETY":
         return None, "CANDIDATE_SAFETY_FILTERED"
 
-    if finish_reason_name not in ("STOP", "MAX_TOKENS"):
+    if finish_reason_name == "MAX_TOKENS":
+        logger.warning(
+            f"Generation for query hit MAX_TOKENS — response may "
+            f"be truncated mid-sentence. Returning partial text rather than "
+            f"failing, but this should be checked."
+        )
+        return response.text, None
+
+    if finish_reason_name != "STOP":
         return None, f"UNEXPECTED_FINISH:{finish_reason_name}"
 
     return response.text, None
