@@ -175,7 +175,7 @@ All 15 rows, including all 10 rewrite-path rows, returned byte-identical `retrie
 
 **q001 — confirmed fixed.** Now resolves via `dense_confident`, never touches rewrite. Deterministic by construction.
 
-**q004 — root cause: not a rewrite problem, a gate-threshold tradeoff.** Widened-pool dense search puts the correct answer at rank 1/15, distance 0.3336 — one of calibration's own recorded "success" distances, sitting in the overlap zone the conservative threshold was built to exclude from trust. Deferred to rewrite, where it's then answered wrong. Not a new bug — the threshold's design explicitly accepted this tradeoff at calibration time. The exact size of the sacrificed-success group ("~4" vs. 5 implied elsewhere) has not been reconciled — parked, see Known Limitations.
+**q004 — root cause: not a rewrite problem, a gate-threshold tradeoff.** Widened-pool dense search puts the correct answer at rank 1/15, distance 0.3336 — one of calibration's own recorded "success" distances, sitting in the overlap zone the conservative threshold was built to exclude from trust. Deferred to rewrite, where it's then answered wrong. Not a new bug — the threshold's design explicitly accepted this tradeoff at calibration time. The exact size of the sacrificed-success group ("~4" vs 5 implied elsewhere) has not been reconciled — parked, see Known Limitations.
 
 **q015 — known limitation, not a new regression.** Confident on the `both` route via an unfiltered whole-store search, but only 0.5 recall (misses T1190) — same recall as under rewrite before.
 
@@ -323,7 +323,7 @@ Tiering saves 22.8% vs. all-Pro, costs 210% more than all-Flash — modest savin
 
 ---
 
-## Known Limitations — July 18 (original entries; see `eval_pipeline.md` for the current consolidated list including #4, added July 19)
+## Known Limitations — July 18 (original entries; see `eval_pipeline.md` for the current consolidated list, further revised July 21)
 
 ### 1. Chunk fragmentation at ingestion (T1140, scope beyond it unknown)
 
@@ -331,7 +331,7 @@ T1140.txt is split across two separate chunks — confirmed by direct query, not
 
 **Effect.** A query needing the example specifically (q003) fails whenever only the definition chunk is retrieved, but recall@3 still reports success — recall is scored at the `technique_id` label level and can't see a technique's content is split across chunks.
 
-**Scope not established.** T1140 is the only technique confirmed so far, found while investigating one query's failure, not a systematic sweep.
+**Scope not established.** T1140 is the only technique confirmed so far, found while investigating one query's failure, not a systematic sweep. *(Superseded July 21 — see below and `eval_pipeline.md`, Known Limitation #1: a full-corpus sweep found 179/1823 entries, 9.8%, fragmented.)*
 
 **Why not fixed now.** Requires an ingestion-time change or a recall-metric change; both larger than a same-day fix, out of scope for the boundary.
 
@@ -343,12 +343,137 @@ T1140.txt is split across two separate chunks — confirmed by direct query, not
 
 **Why it matters beyond q003.** Systematic risk: any query whose top-1 distance lands within rounding distance of the true threshold is subject to the same silent misclassification, in either direction.
 
-**Why not fixed now.** Low-risk, mechanical fix; not because it's difficult.
+**Why not fixed now.** Low-risk, mechanical fix; not because it's difficult. *(Moot as of July 21 — the confidence gate and its threshold are retired. See below.)*
 
 ### 3. Overlap-zone success count, unreconciled (parked)
 
-The Jul 14 q004 write-up refers to "~4" sacrificed successes; direct arithmetic from the same section's own numbers implies 5. Not reconciled — could be an approximation in original wording, or a genuine calibration-time vs. production-time search difference (the `both`-route caveat already named in `confidence_gate.py`'s docstring). Parked deliberately; the original success/failure distance lists would resolve this if revisited.
+The Jul 14 q004 write-up refers to "~4" sacrificed successes; direct arithmetic from the same section's own numbers implies 5. Not reconciled — could be an approximation in original wording, or a genuine calibration-time vs. production-time search difference (the `both`-route caveat already named in `confidence_gate.py`'s docstring). Parked deliberately; the original success/failure distance lists would resolve this if revisited. *(Moot as of July 21 — no overlap zone concept exists without the gate. See below.)*
 
 ---
 
-*End of chronological record as of July 19, 2026. Entries added July 19 (doc split, terminology table, resubstitution disclosure) are cross-referenced above and consolidated in `eval_pipeline.md`.*
+## Confidence Gate Retirement + Merge/Rerank Redesign + Diagnostic Session — July 21, 2026
+
+### Context
+
+`eval_pipeline.md`'s Known Limitations #2 (threshold precision loss), #3 (unreconciled overlap-zone count), and #4 (resubstitution, not held-out validation) all traced back to the confidence gate's calibrated distance threshold. Rather than fix each individually, the gate was retired entirely and replaced with a cross-encoder reranker — removing the threshold removes all three limitations as a structural byproduct, not three separate patches.
+
+### Architecture, three revisions in one session
+
+**Revision 1 (flat merge+rerank).** Exact-match unchanged. For every other query: dense search (widened to `RERANK_POOL_K=15`) and rewrite/decomposition (also widened) both run unconditionally — no gate deciding which to trust. Both pools merged, deduped by `technique_id`, reranked ONCE against the raw query (`cross-encoder/ms-marco-MiniLM-L-6-v2`). MLflow arm tag renamed `routed_with_fixes` → `routed_with_fixes_reranked` so pre/post-rearchitecture runs aren't conflated.
+
+Diagnostic tooling built alongside: `inspect_candidate_pool.py` — pulls raw dense and rewrite pools *before* dedup/merge (something the production pipeline's own `candidate_pool` field, captured post-dedup, cannot show), checks whether an `expected_id` is present anywhere in the raw union (coverage) vs. present but not in top-k (ranking), and prints full-width reranked scores (not just top-3) so a losing candidate's actual rank and score gap is visible.
+
+**Three real diagnoses from Revision 1, run against q003, q010, q015:**
+
+| Query | Failure | Mechanism |
+|---|---|---|
+| q003 | T1140 (expected) lost a near-tie at rank #5, score -1.1309, spread of 0.02 among 3 candidates just below the top-3 cutoff | Initially hypothesized as dedup collision (see Retraction, below) — actual cause: scored against the raw query instead of canonical phrasing |
+| q010 | T1105 (expected) lost decisively (rank #5, -2.4754, 4.91 behind the leader) to T1659/T1650 | Root-caused: `ingest.py` embeds header lines (`TACTIC: Initial Access`) verbatim as scoreable chunk text; query's own "Once initial access is achieved..." phrasing matched the header literally |
+| q015 | T1190 (expected) lost decisively (rank #18/25, -3.7646, 8.86 behind the leader) — **every** MITRE technique in the pool scored negative, every CVE but two scored positive | Category-level suppression: compound query (CVE half + MITRE half) scored as one string; a 100%-MITRE chunk scores poorly against a CVE-dominated query regardless of which specific technique it is |
+
+**Retraction, mirroring the project's existing q003-eligibility precedent (Jul 15 entry, above):** q003's failure was initially attributed to `_dedupe_merge()` colliding T1140's two known-fragmented chunks (definition vs. worked-example — Known Limitation #1), on the reasoning that both chunks could plausibly enter the merged pool from different sources and only one survive dedup. **This was tested directly via `inspect_candidate_pool.py` and disconfirmed:** T1140 was present and intact in the post-dedup pool (position 1 of 19); dedup was not the cause. The actual cause (below) is unrelated to fragmentation. Flagged here explicitly, same as q003's earlier CVE-eligibility retraction, rather than silently corrected.
+
+**Incidental finding, independent of any single query's diagnosis:** chunk fragmentation (same `technique_id`, multiple distinct chunks) confirmed on 5 additional techniques beyond T1140 during these diagnostic runs — T1027, T1202 (found via q003), T1650, T1659 (found via q010), T1105, T1570 (found via q010's later re-run). Not a targeted sweep; found by accident while diagnosing unrelated failures. Updates Known Limitation #1's scope. *(Superseded later the same day — see Full-Corpus Fragmentation Sweep, below.)*
+
+### Fix 1 — Guaranteed-slot restoration (Revision 2)
+
+**Root realization:** `retrieve_with_rewrite()`'s own original merge logic already had a guaranteed-slot mechanism (each sub-query's best-by-distance result seated first, preventing one sub-query's results from starving another's). Revision 1's flat merge silently discarded this — treating rewrite's output as "just another pool to merge and rerank" lost the protection entirely. This is plausibly why q010 broke under the new architecture in the first place (the old gated arm got q010 right via this exact mechanism, using distance).
+
+**Implementation.** `query_rewrite.py`'s `retrieve_with_rewrite()` gained `return_subquery_pools` (additive, default `False`, existing callers byte-identical) — exposes each sub-query's raw candidates *before* that function's internal merge collapses them. `retrieval_pipeline.py`'s new `_guaranteed_slot_rerank_merge()`: each sub-query's own best candidate, reranked against **its own sub-query text**, gets a seat first (cross-sub-query score comparability explicitly not assumed, same caution the original distance-based version documents). Remaining slots filled from whatever's left, reranked against the **original raw query** — one shared, comparable surface.
+
+**Result: q003 fixed, confirmed.** T1140 scored 6.4317 against its rewritten sub-query text (a MITRE-canonical rephrasing per `rewrite_query()`'s own Rule 3) vs. 5.5268 for the runner-up — a clean win, not a near-tie. Confirms the hypothesis that canonical rephrasing, not just wider pools, was what q003 needed.
+
+**Result: q015 partially improved.** T1190 moved from -3.7646 (Revision 1, scored against the compound raw query) to +2.0278/-1.0634 across two sub-query-scored runs — no longer category-suppressed. Did not fully resolve (see Fix 3 and Residual, below).
+
+### Fix 2 — Metadata header stripping
+
+**Root cause, confirmed on q010.** `ingest.py` embeds raw `.txt` file text verbatim into chunks — `TECHNIQUE_ID:`, `TACTIC:`, `DATE_ADDED:`, `Technique Name:`, `Platforms:` (MITRE format) and `VULNERABILITY_ID:`, `Vulnerability Name:`, `Vendor:`, `Product:`, `Patch Due Date:` (KEV format) are literal, scoreable chunk content, not stripped metadata. Query "Once initial access is achieved..." matched T1659's chunk on the literal line `TACTIC: Initial Access` — pure header-phrase overlap, unrelated to the chunk's actual content about content injection.
+
+**Implementation.** `reranker.py`: `_strip_metadata_header()`, a regex over the observed field-label set (not a repo-wide sweep of `threat_reports/*.txt` — widen if a future run surfaces an uncovered field), applied only to the text passed into the cross-encoder's scoring pairs inside `rerank()`. The text returned in `rerank()`'s output tuples — and therefore everything citations/generation ever see — is untouched. Confirmed via smoke test (`rerank()` output equals original input, not the stripped version).
+
+**First re-test of q010 (with header stripping, still on L-6-v2): still failed.** T1570 beat T1105, but for a *different* reason this time — worth naming this as a genuine second mechanism, not a failed fix. Led to the model-capacity test, below.
+
+### Model swap test — ms-marco-MiniLM-L-6-v2 → L-12-v2
+
+**Motivation.** After header-stripping, T1570 (wrong) still beat T1105 (correct) on q010 — not a near-tie (5.8905 vs. -0.9483, a real gap). Hypothesis: capacity ceiling in the smaller model.
+
+**Test design.** Same MS MARCO family/training data, more capacity — deliberately not jumping to a different architecture (`bge-reranker-base`) yet, to isolate capacity as a single variable.
+
+**Result: hypothesis REJECTED, and the data pointed the opposite direction.** T1570's score rose from 5.8905 → 7.0617 (+1.17); T1105's rose only -0.9483 → -0.4962 (+0.45). The larger model was *more* confident in the wrong answer, not less — ruling out "insufficient capacity" and suggesting a real, strong textual signal was driving the score (which a bigger model would naturally weight more, not less).
+
+### Fix 3 — Technique cross-reference stripping
+
+**Root cause, confirmed on TWO independent technique pairs, checked directly against real chunk text (not inferred).**
+
+- **T1570 → T1105:** T1570's chunk contains `"(i.e., [Ingress Tool Transfer](https://attack.mitre.org/techniques/T1105))"` — T1105's exact canonical name and ID, embedded as a loose parenthetical association.
+- **T1189 → T1190:** T1189's chunk contains `"Unlike [Exploit Public-Facing Application](https://attack.mitre.org/techniques/T1190), the focus of this technique is..."` — T1190's exact canonical name and ID, embedded inside an **explicit negation**. T1189 still won the guaranteed slot over T1190 despite this, ruling out any hope that "the model probably ignores links in dismissive/contrastive framing" — it doesn't reliably use surrounding grammar as a signal at all.
+
+MITRE ATT&CK write-ups routinely cross-reference related techniques this way; this is a structural property of the source data, not a one-off collision.
+
+**Implementation.** `reranker.py`: `_strip_technique_crossrefs()` — strips the entire markdown link construct (bracketed name AND url) for `/techniques/` links (parent and sub-technique paths, e.g. `T1027` and `T1027/010`), applied uniformly regardless of surrounding phrasing (per the negation finding, above). Scope confirmed only for `/techniques/` links — `/software/`, `/groups/`, `/tactics/` links deliberately left untouched, not confirmed as a problem. Verified via smoke test against the actual T1570 and T1189 chunk text (not synthetic stand-ins): both cross-references correctly removed, real surrounding content preserved, `rerank()`'s returned text still the original unstripped version.
+
+**Result: q010 fixed, confirmed with real data** T1105 -1.8027 vs. T1570 -3.5625 — a clean 1.76-point margin.
+
+**Result: q015's T1189 threat resolved, confirmed.** T1189 dropped from beating T1190 by 6.5 points to losing by ~1.4–3.4 points across runs. **But a third, different competitor (T1203) then won the guaranteed slot**, by a narrow 0.5909-point margin (2.6990 vs. 2.1087) — not a landslide, and not decisively resolved by this fix.
+
+### q015 residual — T1203 vs. T1190, documented as Known Limitation #7
+
+**Checked directly:** T1203's chunk contains no markdown cross-reference to T1190. Not the header or crossref pattern. T1203 ("Exploitation for Client Execution") and T1190 ("Exploit Public-Facing Application") are legitimately similar techniques — both fundamentally "exploit a vulnerability to execute code" — with a real but comparatively subtle distinguishing detail (client vs. public-facing server) for passage-relevance scoring specifically.
+
+**Decision: document, don't further engineer against, absent stronger evidence.** Two candidate fixes considered and explicitly declined: (1) `bge-reranker-base` — a genuinely different architecture/training-data test, not ruled out, just not pursued without more justification than one query; (2) widening the guarantee to top-2-per-subquery when the score margin is small — speculative, no confirmed mechanism to justify building it. Consistent with this project's rigor-over-production-ceremony philosophy. Full writeup: `eval_pipeline.md`, Known Limitation #7.
+
+### Fix 2, refined — administrative vs. descriptive-title header fields
+
+**Regression found via full-suite run, not targeted diagnosis.** After Fix 3 landed, a full-suite eval run (below) surfaced q013 regressing to 0.00 recall — never individually diagnosed until the full run caught it, three architecture revisions after it started silently degrading (1.00 → 0.50 → 0.00, invisible because no targeted diagnostic run happened to include q013).
+
+**Root cause, confirmed on real chunk text.** Fix 2's header-stripping treated `Technique Name:`/`Vulnerability Name:` the same as purely administrative fields (`TACTIC:`, `DATE_ADDED:`, etc.) — full-line removal. But these two fields carry the technique/vulnerability's actual descriptive title, not category metadata. `CVE-2017-0005`'s `Vulnerability Name` is *"...GDI Privilege Escalation Vulnerability"* — with that line gone, its body only says *"gain privileges"* (paraphrase, not the query's literal phrase), while a wrong candidate (`CVE-2014-1812`) happened to restate "privilege escalation" verbatim in its own body and won purely on that coincidence.
+
+**Implementation.** Split `_strip_metadata_header()` into two passes: full-line removal for `TECHNIQUE_ID`, `VULNERABILITY_ID`, `TACTIC`, `DATE_ADDED`, `Platforms`, `Vendor`, `Product`, `Patch Due Date` (unchanged, still catches q010's original `TACTIC:` confound); label-only removal for `Technique Name`/`Vulnerability Name` — the value now survives scoring. Verified via smoke test that both the q010 confound (`TACTIC: Initial Access`, fully stripped) and the q013 regression (`Vulnerability Name` value, now preserved) are handled correctly by the same function.
+
+**Result: q013 fixed, decisively.** `CVE-2017-0005` 9.1439 vs. runner-up 8.9170 (`CVE-2017-0001`, the other expected ID) vs. third-place 6.4243 — both expected IDs took the top two slots with a real gap to anything else.
+
+**Result: q010 re-confirmed, no regression from the refinement.** T1105 9.2137 vs. T1570 0.9764 — an 8.2-point margin, wider than the 1.76-point margin at the original Fix 3 confirmation. Checked explicitly rather than assumed safe, since q010's original confound (`TACTIC:`) is untouched by this change but "should be unaffected" had already proven an unsafe assumption once this session (the model-swap caching scare).
+
+### Full-suite run — first real confirmed numbers post-rearchitecture
+
+With all three fixes in place (guaranteed-slot restoration, crossref stripping, refined header stripping), a full 15-row eval run:
+
+| | Recall | Precision |
+|---|---|---|
+| Blind / routed (unaffected by any of this) | 0.5667 | 0.2444 |
+| This session, flat merge (before today's fixes) | 0.7222 | 0.4000 |
+| Old gated arm (retired architecture, different pipeline) | 0.8222 | 0.4778 |
+| **Current architecture, final** | **0.9444** | **0.5111** |
+
+First run all session to beat the old pre-rearchitecture reference point on both axes simultaneously — earlier intermediate states had traded one metric for the other. q003, q010, q013, q016 all confirmed at 1.00 recall. q015 at 0.50, matching Known Limitation #7 exactly.
+
+**q005 improved (0.33 → 0.67) without being targeted by any fix this session** — noted as an open, unconfirmed hypothesis (plausibly the same header-refinement mechanism helping T1078 compete on its own canonical name), not claimed as understood.
+
+### q005 investigation — a second manifestation of Limitation #7
+
+**Motivation.** The unplanned q005 improvement above prompted a direct check, same protocol as every other query this session, rather than accepting an unexplained gain without diagnosis.
+
+**Finding: guaranteed-slot budget exhaustion, not a text artifact.** q005 decomposed into exactly 3 sub-queries — matching `RETRIEVAL_TOP_K=3` exactly. All 3 guaranteed slots filled (sub-queries 2 and 3 correctly guaranteed `T1078` and `T1098`; sub-query 1 guaranteed `T1621` over the expected `T1111`, an 8.7969 vs. 7.4099 near-tie — comparable margin to T1203/T1190, not a decisive artifact loss). Because all `k=3` slots were already guaranteed, **the fill step never ran at all** — `T1111` had zero path back into the result regardless of how it might have scored. A sharper version of Limitation #7's "runner-up gets no protection" property: when guaranteed slots exactly consume `k`, there isn't even a fill step to fall back on.
+
+**Text check, same rigor as every other diagnosis this session:** pulled T1111's actual chunk directly — no markdown cross-reference to T1621 or any other technique. Rewrite's sub-query text ("Bypass Multi-Factor Authentication") is neutral, containing neither T1621's nor T1111's canonical name — ruled out as a cause.
+
+**Discovered via this check: T1111 is fragmented (2 chunks)**, confirmed via a new tool built specifically to check this and a second hypothesis (cross-encoder token truncation) directly rather than inferring from possibly-stale pasted text. Truncation ruled out cleanly — both T1111 chunks (181 and 218 tokens combined with the query) are well under the model's 512-token limit. Fragmentation, not truncation, is the more likely contributing factor — though whether fixing it would close a 1.39-point gap remains untested.
+
+### Full-corpus fragmentation sweep
+
+**Motivation.** T1111's fragmentation, found by accident investigating q005, prompted the question already implicit after 7 incidental discoveries: how big is this actually? Built a standalone script — one `db.collection.get()` call over the whole collection, grouped by `(corpus, technique_id)`, counting chunks per entry. Read-only, zero risk to any metric.
+
+**Result: far larger than incidental discovery suggested.**
+
+| | Count |
+|---|---|
+| Total chunks | 2,140 |
+| Unique (corpus, technique_id) entries | 1,823 |
+| Fragmented (>1 chunk) | **179 (9.8%)** |
+| Max fragmentation | T1034 — 7 chunks |
+
+**Directly checked, per the open question from Limitation #7's writeup:** `T1203` and `T1190` (q015's unresolved near-tie) are both fragmented, 3 chunks each. Whether a fragmentation fix helps, worsens, or doesn't move this specific near-tie is unknown — both sides of the comparison are equally affected, not confirmed to favor one direction.
+
+---
+
+*End of chronological record as of July 21, 2026.*
