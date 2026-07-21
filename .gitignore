@@ -192,3 +192,4 @@ mlartifacts/
 !eval_set.json
 raw.py
 inspect_candidate_pool.py
+seed_faithfulness_scratch.py
