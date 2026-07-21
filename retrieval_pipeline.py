@@ -1,8 +1,9 @@
 """
 retrieval_pipeline.py — retrieve_for_route()
 
-ARCHITECTURE, third revision (Jul 21, 2026 — see below for what changed
-from the Jul 2026 merge+rerank version and why):
+ARCHITECTURE, fourth revision (fragmentation fix added on top of the third
+revision, Jul 21, 2026 — see below for the third revision's own history,
+still unchanged):
 
   Step 1 — exact match: unchanged since the original version. Literal
   CVE/technique IDs in the raw query fetched directly via ChromaDB
@@ -34,27 +35,67 @@ from the Jul 2026 merge+rerank version and why):
   same caution retrieve_with_rewrite() already documents for raw
   distances). Only the FILL step's scores are mutually comparable.
 
-  ALSO NEW — header stripping (see reranker.py): confirmed on q010 that
-  ingest.py's verbatim-embedded TACTIC:/TECHNIQUE_ID: header lines were
-  winning cross-encoder matches on pure header-phrase overlap, unrelated
-  to chunk content. Fixed inside rerank() itself — applies everywhere
-  automatically, no separate wiring needed here.
+  ALSO NEW (third revision) — header stripping (see reranker.py):
+  confirmed on q010 that ingest.py's verbatim-embedded TACTIC:/
+  TECHNIQUE_ID: header lines were winning cross-encoder matches on pure
+  header-phrase overlap, unrelated to chunk content. Fixed inside
+  rerank() itself — applies everywhere automatically, no separate wiring
+  needed here.
 
   STILL REMOVED: the confidence gate (is_confident(), threshold,
   calibration). No threshold anywhere in this file.
 
-  STILL OPEN, NOT ADDRESSED BY THIS REVISION: a statistical near-tie just
-  below the top-k cutoff (confirmed on q003 — three candidates within a
-  0.02 score spread, one slot too shallow) isn't fixed by guaranteed slots
-  or header-stripping. The guaranteed-slot restoration MAY help it as a
-  side effect (rewrite's canonical MITRE phrasing could score better than
-  the raw query did) — unconfirmed until re-tested, not claimed as fixed.
+  STILL OPEN, NOT ADDRESSED BY THE THIRD REVISION: a statistical near-tie
+  just below the top-k cutoff (confirmed on q003 — three candidates within
+  a 0.02 score spread, one slot too shallow) isn't fixed by guaranteed
+  slots or header-stripping. The guaranteed-slot restoration MAY help it
+  as a side effect (rewrite's canonical MITRE phrasing could score better
+  than the raw query did) — unconfirmed until re-tested, not claimed as
+  fixed.
 
-  KNOWN OPEN RISK, UNCHANGED FROM PRIOR REVISION: dedup key is still
-  technique_id. T1140-style chunk fragmentation (Known Limitation #1) is
-  now confirmed to affect at least 5 techniques (T1140, T1027, T1202,
-  T1650, T1659 — found incidentally across diagnostic runs, not a targeted
-  sweep), not just T1140. Not fixed here.
+  ─────────────────────────────────────────────────────────────────────
+  FOURTH REVISION, FRAGMENTATION FIX (this revision):
+
+  Confirmed via full-corpus sweep, Jul 21, 2026: 179 of 1,823 unique
+  (corpus, technique_id) entries (9.8%) are split across multiple
+  ChromaDB chunks — a structural property of how ingest.py chunks source
+  files, not an edge case. Max fragmentation: T1034, 7 chunks.
+
+  The dedup key in _guaranteed_slot_rerank_merge() is technique_id — a
+  fragmented entry's chunks previously competed against each other for a
+  single slot, using whichever chunk each scoring pass happened to see.
+  q003 was resolved favorably by chance (the better-scoring of T1140's 2
+  chunks survived); q015 (T1203 vs. T1190, both 3 chunks) and q005 (T1621
+  vs. T1111, both fragmented — T1621's status confirmed this session) were
+  not.
+
+  FIX: _resolve_fragments() runs BEFORE either the guaranteed-slot rerank
+  or the fill-step dedup. Any candidate whose technique_id is in the
+  live-computed fragmented set gets replaced with one candidate built from
+  ALL its chunks (fetched fresh via db.collection.get, not just whichever
+  fragment happened to already be in the pool), concatenated. Scoring-
+  level fix — same isolation contract as the header/crossref strip:
+  changes what the scorer sees, never what's returned/cited/generated.
+  Dedup key (technique_id) is UNCHANGED — this supplements the existing
+  merge logic, doesn't replace it.
+
+  Targeted, not fetch-everything: _fragmented_ids(db) computes the
+  fragmented set live from collection metadata (cached per process — no
+  persisted file, no drift risk, since corpus drift is already confirmed
+  real this session). Only the 9.8% that need it trigger an extra DB call;
+  the other 90.2% pass through untouched.
+
+  KNOWN OPEN QUESTION, NOT RESOLVED BY THIS FIX: whether concatenating
+  T1621 and T1111 closes, worsens, or leaves the q005 near-tie unchanged
+  is untested until this ships and gets re-scored against the eval set.
+  Same for q015's T1203/T1190. Documented as open, not assumed either way.
+
+  KNOWN LIMITATION OF THIS FIX'S CACHE: _FRAGMENTED_IDS is a module-level
+  cache computed once per process. A long-running process won't notice
+  newly-fragmented entries (e.g. from corpus drift) until restart. Fine
+  for this pipeline's actual usage (re-invoked per eval run, not a
+  long-lived server) — flagged as a deliberate tradeoff, not a silent one.
+  ─────────────────────────────────────────────────────────────────────
 """
 
 import logging
@@ -68,15 +109,70 @@ import config
 logger = logging.getLogger(__name__)
 
 
+# ── Fragmentation resolution (fourth revision) ─────────────────────────
+
+_FRAGMENTED_IDS: set[str] | None = None
+
+
+def _fragmented_ids(db) -> set[str]:
+    """
+    technique_ids with >1 chunk in storage. Computed once per process from
+    live metadata — always current, no build step, no drift risk. Cost:
+    one full metadata pull (~2,140 rows) on first call, cached after.
+    """
+    global _FRAGMENTED_IDS
+    if _FRAGMENTED_IDS is None:
+        rows = db.collection.get(include=["metadatas"])
+        counts: dict[str, int] = {}
+        for meta in rows["metadatas"]:
+            tid = meta.get("technique_id")
+            counts[tid] = counts.get(tid, 0) + 1
+        _FRAGMENTED_IDS = {tid for tid, n in counts.items() if n > 1}
+    return _FRAGMENTED_IDS
+
+
+def _resolve_fragments(db, candidates: list[tuple[dict, str]]) -> list[tuple[dict, str]]:
+    """
+    Any candidate whose technique_id is fragmented gets replaced with one
+    candidate built from ALL its chunks, fetched fresh — not just whichever
+    fragment was already in this pool. Everything else passes through
+    untouched. Must run before rerank/dedup — same isolation contract as
+    the header/crossref strip in reranker.py: changes what the scorer
+    sees, never what's returned/cited/generated.
+    """
+    fragmented = _fragmented_ids(db)
+    resolved: list[tuple[dict, str]] = []
+    done: set[str] = set()
+    for meta, doc in candidates:
+        tid = meta.get("technique_id")
+        if tid not in fragmented:
+            resolved.append((meta, doc))
+            continue
+        if tid in done:
+            continue
+        done.add(tid)
+        rows = db.collection.get(
+            where={"$and": [{"corpus": {"$eq": meta.get("corpus")}},
+                             {"technique_id": {"$eq": tid}}]},
+            include=["documents", "metadatas"],
+        )
+        merged_meta = dict(rows["metadatas"][0])
+        merged_meta["fragment_count"] = len(rows["documents"])
+        resolved.append((merged_meta, "\n\n".join(rows["documents"])))
+    return resolved
+
+
 def _guaranteed_slot_rerank_merge(
+    db,
     query: str,
     dense_candidates: list[tuple[dict, str]],
     subquery_pools: list[dict],
     k: int,
 ) -> list[tuple[dict, str, float]]:
     """
-    Replaces the flat dedupe-then-single-rerank approach from the prior
-    revision. See module docstring for the full rationale.
+    Replaces the flat dedupe-then-single-rerank approach from the second
+    revision. See module docstring for the full rationale, including the
+    fourth-revision fragmentation fix applied at the top of this function.
 
     dense_candidates: raw (metadata, document_text) pairs from dense
     search on the RAW query — not yet deduped, not yet scored.
@@ -92,6 +188,14 @@ def _guaranteed_slot_rerank_merge(
     retrieve_with_rewrite()'s own original merge already has; not a new
     convention invented here.
     """
+    # ── Fragmentation resolution — runs before anything else touches
+    #    these candidates. See module docstring, fourth revision. ──
+    dense_candidates = _resolve_fragments(db, dense_candidates)
+    subquery_pools = [
+        {**sq_pool, "candidates": _resolve_fragments(db, sq_pool["candidates"])}
+        for sq_pool in subquery_pools
+    ]
+
     seen: set[str] = set()
     final: list[tuple[dict, str, float]] = []
 
@@ -158,8 +262,9 @@ def retrieve_for_route(
     matched storage. path="exact_match".
 
     Step 2/3 — dense (widened) + rewrite (widened, per-sub-query pools
-    exposed) → guaranteed-slot merge → rerank. path="merged_reranked". See
-    module docstring for the full mechanism and why it changed.
+    exposed) → fragmentation resolution → guaranteed-slot merge → rerank.
+    path="merged_reranked". See module docstring for the full mechanism
+    and why it changed.
 
     return_pool: if True, includes the FULL union of raw candidates
     (deduped, PRE-final-selection) under "candidate_pool" — for the
@@ -236,7 +341,9 @@ def retrieve_for_route(
 
     # Fail-loud pool-size guard: unique technique_id count across the full
     # union (dense ∪ every sub-query pool), before any final-selection
-    # logic runs.
+    # logic runs. Deliberately checked BEFORE fragmentation resolution —
+    # this counts unique technique_ids, which fragmentation resolution
+    # doesn't change the count of, only the content behind each one.
     all_ids: set[str] = {m.get("technique_id") for m, _ in dense_candidates}
     for sq_pool in subquery_pools:
         all_ids |= {m.get("technique_id") for m, _ in sq_pool["candidates"]}
@@ -250,7 +357,7 @@ def retrieve_for_route(
             f"problem, not a legitimately sparse result set."
         )
 
-    top = _guaranteed_slot_rerank_merge(query, dense_candidates, subquery_pools, k)
+    top = _guaranteed_slot_rerank_merge(db, query, dense_candidates, subquery_pools, k)
 
     out = {
         "documents": [[doc for _, doc, _ in top]],
