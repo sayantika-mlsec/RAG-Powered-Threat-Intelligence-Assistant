@@ -542,4 +542,46 @@ Improves both axes simultaneously, same bar the rearchitecture itself cleared. R
 
 ---
 
-*End of chronological record as of July 21, 2026.*
+## Faithfulness Re-Score, Generation-Capture Arm Collapse, and a Truncation Bug — July 22, 2026
+
+### Context
+
+Faithfulness had not been re-scored since July 19 — through both the confidence-gate rearchitecture and the fragmentation fix. Before running it, `generation_capture.py` needed fixing first: it called `run_pipeline(..., use_confidence_gate=...)`, a parameter that no longer exists.
+
+### Arm collapse, confirmed against `app.py`
+
+`run_pipeline()`'s current signature is `(query, *, use_routing, n_results=N_RESULTS)` — no gate parameter at all. Per its own docstring, `use_routing=True` now always runs the full `retrieve_for_route()` pipeline; the old "routed but ungated" mode (plain `semantic_search` after a routing decision) no longer exists as a code path. This collapsed the three-arm model (`blind` / `ungated-routed` / `gated-routed`) `generation_capture.py` was built around down to two arms (`blind` / `routed`).
+
+**Fixed:** `--use-confidence-gate` removed from the CLI; `capture_row()`, `run_capture()`, and `_write_artifact()` all dropped the parameter. A `retrieval_snapshot` field (manually-set stamp, `"fragmentation_fix_2026-07-21"`) was added to every row for forward provenance visibility — deliberately excluded from `REQUIRED_ROW_KEYS` so it can't force an unnecessary regen of the blind arm, which this change never touched. An `--out-path` override flag was added so a fresh capture (`generation_capture_post_frag.json`) could be taken without overwriting or renaming the prior `generation_capture_gated.json` — kept as an untouched historical artifact.
+
+**Flagged, not yet acted on:** any pre-existing `generation_capture_routed.json` from before this collapse is now stale in a way `REQUIRED_ROW_KEYS` cannot detect — same fields, produced by a retired code path (plain `semantic_search` vs. the current `retrieve_for_route()`). Noted in the script's own module docstring as a standing risk for whoever next runs the default `--use-routing` flag without `--out-path`.
+
+### First faithfulness run under the current architecture
+
+`CAPTURE_ARTIFACT` repointed to `generation_capture_post_frag.json`; `RECALL_BASELINE_RUN_ID` repointed to the fragmentation-fix full-suite MLflow run. Result: **mean 3.867, N=15 eligible, N=0 gated out** — full eligibility for the first time (q004, the sole gated-out row under every prior architecture, now retrieves successfully).
+
+### q015 — truncation bug, not a faithfulness finding
+
+q015 scored 2/5; the judge's own reason included "the answer is cut off mid-sentence." Confirmed directly from `generation_capture_post_frag.json`: `output_tokens=78`, `thinking_tokens=1966`, summing to 2,044 against `threat_analyzer.py`'s `GENERATION_CONFIG.max_output_tokens=2048` — four tokens from the cap. Checked the other high-thinking Pro-tier rows (q002, q004, q005, q013, q016): none truncated — this isn't systemic across every Pro call, but it isn't a fluke either. It specifically hits the "both"-route, compound-answer case: exactly the query shape this project's cross-corpus RAG differentiator is built around.
+
+**Compounding bug, independent of the first:** `_safe_extract_text()` in `threat_analyzer.py` explicitly treated `MAX_TOKENS` as an acceptable finish reason, identical to `STOP` — so the truncated answer returned as a clean, unflagged `success=True`. Nothing distinguished it from a complete answer anywhere downstream.
+
+**Fixed, two edits:**
+1. `max_output_tokens` raised 2048 → 4096 in `GENERATION_CONFIG`.
+2. `_safe_extract_text()` now logs a warning and returns the partial text on `MAX_TOKENS`, rather than treating it as silently equivalent to `STOP`.
+
+**Self-correction, logged rather than silently walked back.** Earlier the same session, the judge script's *own* `_safe_extract_text()` (in `faithfulness_score.py`) was flagged as inconsistent with this one for treating `MAX_TOKENS` as a hard failure instead of a salvageable partial. On reflection this is not actually inconsistent — it's appropriate given the two call sites' different tolerance for partial output: a degraded but readable generation answer is still useful, while a truncated JSON judge reply is unparseable and cannot be salvaged at all. Not treated as a bug needing alignment; noted here so the earlier framing doesn't stand uncorrected.
+
+**Confirmed fixed:** q015's regenerated row shows `output_tokens=93`, `thinking_tokens=1248`, summing to 1,341 — comfortable headroom under 4096. The answer itself reads complete: opens with the negative KEV finding, closes on a full quoted sentence from the T1190 chunk. Re-scored: 2 → 4.
+
+### Final numbers and two new judge-calibration findings
+
+**Mean 4.0, N=15 eligible, N=0 gated out** (60/15, checked by hand, not read off the summary field). Delta from the pre-fix run is exactly +2 — precisely q015's own movement, confirming the resume mechanism touched only what it was supposed to.
+
+**q006 — judge contradicted its own rubric.** Answer: "The parent technique is called Process Injection." T1055's chunk fully supports the substantive claim verbatim. The word "parent" is not an asserted fact about corpus taxonomy — it's an echo of the query's own phrasing ("What's the parent technique called..."). Scored 1 ("largely fabricated"), directly contradicting the rubric's own worked example, which scores trivial connective/framing language a 4, not a 1. Filed as new Known Limitation #8 in `eval_pipeline.md` — single instance, not confirmed systematic.
+
+**q009 — reopens a question the q003 retraction had closed.** Answer: a refusal ("I do not have sufficient information..."), consistent with the July 18 diagnosis of this exact query as a legitimate refusal (the query's WBEM framing isn't stated in the retrieved WMI chunk). Scored 1 — the judge's reasoning treated the refusal itself as unfaithful, despite the judge's own system instruction stating explicitly that it does not judge correctness, only grounding. The July 15 entry (above) concluded, via the q003 retraction, that the leniency-toward-refusal limitation is one-directional. q009 is real evidence of the opposite direction — flagged as new evidence added to Known Limitation #5 in `eval_pipeline.md`, explicitly NOT merged into a "bidirectional" conclusion or dismissed; whether it's noise (q013's 1→5 pattern) or a stable failure is undetermined without the k=3 replication already in Deferred Work.
+
+---
+
+*End of chronological record as of July 22, 2026.*

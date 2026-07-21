@@ -62,25 +62,24 @@ Five rows now confirmed at 1.00 recall: q003, q010, q013, q016 (unchanged from b
 
 Beats the old architecture on both axes simultaneously, same as the pre-fragmentation-fix architecture already did — the fragmentation fix widened that margin further rather than trading one axis for the other.
 
-### Faithfulness and Tier Distribution — NOT re-scored under the new architecture
-
-The tables below are retained from the pre-rearchitecture pipeline and have not been re-captured against current retrieval output. Faithfulness scoring depends on which chunks actually get retrieved, which changed substantially on July 21 (twice — the rearchitecture, then the fragmentation fix) — treat these as historical reference only, not current. Re-scoring faithfulness under the current architecture remains in Deferred Work.
-
-## Current Numbers — Faithfulness / Tier (as of July 19, 2026, pre-rearchitecture — see notice above)
-
-### Faithfulness
+### Faithfulness — RE-SCORED under the current architecture, July 22, 2026
 
 | Arm | Mean | N Eligible | N Ineligible |
 |---|---|---|---|
 | Blind | 4.444 | 9 | 6 |
 | Routed (pre-fix retrieval, stale) | 5.000 | 9 | 6 |
-| **Routed + fixes + Confidence Gate** | **4.429** | **14** | **1** |
+| Routed + fixes + Confidence Gate (retired architecture) | 4.429 | 14 | 1 |
+| **Routed + fixes + fragmentation resolution (current)** | **4.0** | **15** | **0** |
 
-Not re-scored under the new architecture — see Deferred Work.
+**Full eligibility for the first time — 15/0, not 14/1.** q004, the sole gated-out row under every prior architecture, now retrieves successfully and scores a clean 5. A genuine, checkable structural improvement, not a judge artifact.
+
+**4.0 is not directly comparable to 4.429 as a clean delta.** Three confounds, not one: different N (15 vs. 14), materially different underlying retrieval (context changed twice on July 21 — the rearchitecture, then the fragmentation fix), and — new this pass — two rows that look like judge-calibration errors rather than genuine faithfulness failures (see Known Limitations #5 and #8, below). The pipeline's real faithfulness is plausibly higher than 4.0 once those two are accounted for, but that's a judging-quality question to name, not a number to quietly adjust.
+
+**One row's score was a bug, not a finding, until fixed and re-verified.** q015 initially scored 2/5; the judge's own stated reason included "the answer is cut off mid-sentence" — a `MAX_TOKENS` truncation, not a grounding failure. Root cause: `threat_analyzer.py`'s `GENERATION_CONFIG` capped `max_output_tokens` at 2048, shared between thinking and output tokens with no separate budget — q015's compound cross-corpus answer used 1,966 thinking + 78 output = 2,044/2,048, four tokens from the wall. A second bug compounded it: `_safe_extract_text()` treated `MAX_TOKENS` as an acceptable finish reason, identical to `STOP` — so the truncated answer returned as a clean, unflagged success. Fixed: cap raised to 4096; `MAX_TOKENS` now logs a warning instead of passing silently. q015 alone was re-captured and re-scored (not a full re-run — `generation_capture.py`'s resumability and the judge script's scratch-file resume both made this a single-row operation). Re-verified: 93 output + 1,248 thinking = 1,341 tokens, real headroom; answer reads complete, ends on a full sentence; score moved 2 → 4. The table above reflects the post-fix number.
 
 ### Tier Distribution & Cost/Latency (Routed Arm)
 
-13 flash / 7 pro (35% pro), captured under the pre-rearchitecture pipeline. Retrieval-side changes since then don't directly affect tier classification (a routing-layer decision, made before retrieval runs), but this hasn't been re-verified post-rearchitecture or post-fragmentation-fix.
+13 flash / 7 pro (35% pro), captured under the pre-rearchitecture pipeline. Retrieval-side changes since then don't directly affect tier classification (a routing-layer decision, made before retrieval runs), but this hasn't been re-verified post-rearchitecture or post-fragmentation-fix — still open, unlike faithfulness above.
 
 ---
 
@@ -128,7 +127,9 @@ Full-corpus sweep confirmed the scope before the fix shipped:
 
 **2, 3, 4. RESOLVED BY REMOVAL, not by fix.** The confidence gate's threshold-precision-loss, unreconciled overlap-zone count, and resubstitution-not-held-out-validation limitations are retired along with the gate itself (July 21, 2026) — there is no threshold left to have these properties. Full rationale in `docs/lab-notes.md`. Not re-numbered below to avoid breaking existing cross-references to #5/#6.
 
-**5. Faithfulness judge is lenient toward wrongful refusal.** Unchanged, still open. An answer with no claims trivially passes the grounding check. Confirmed on q013 and q015 (blind vs. routed: same refusal, scores 1 then 5). Correctness-vs-gold metric remains deferred but justified by data, not yet built.
+**5. Faithfulness judge is lenient toward wrongful refusal.** An answer with no claims trivially passes the grounding check. Confirmed on q013 and q015 (blind vs. routed: same refusal, scores 1 then 5). Correctness-vs-gold metric remains deferred but justified by data, not yet built.
+
+**New evidence, July 22, 2026, NOT yet reconciled — flagged explicitly rather than merged or dismissed either way.** q009 (current architecture's faithfulness re-score) shows the OPPOSITE direction: a defensible refusal — consistent with the July 18 diagnosis of this exact query as a "legitimate refusal (eval-set defect)," since the query's WBEM framing isn't stated in the retrieved WMI chunk — scored 1, with the judge's own reasoning treating the refusal itself as the unfaithful act. The judge's system instruction explicitly states it is not judging correctness, only grounding; penalizing a no-claims refusal contradicts that instruction on its face. This is the same query-and-mechanism shape as the q003 retraction (see Gated Faithfulness Re-Score, July 15, in `docs/lab-notes.md`) that concluded this limitation was one-directional, not bidirectional — q009 is real evidence the judge can fail in both directions, not just leniency. Deliberately NOT resolved this session: whether q009 is itself noise (same category as q013's documented 1→5 flip) or a stable judge-instruction-following failure is unknown without repetition. Judge k=3 replication (already in Deferred Work) is the natural next step, and directly relevant to the correctness-vs-gold metric already planned — "was this refusal correct" is precisely a correctness question, not a faithfulness one.
 
 **6. Tier classification instability, q003 (gated arm), unresolved.** Unchanged, still open. **Disambiguation, added July 21:** this is unrelated to the *separate* q003 retrieval-near-tie finding (Limitation #7's build history) — same query ID, two different subsystems (routing-layer tier classification vs. retrieval-layer reranking), diagnosed in different sessions. The tier-instability finding concerns whether `route_query()` classifies q003 as `flash` or `pro` across repeated runs; it has nothing to do with which chunks get retrieved for it. Kept separate deliberately, not merged, to avoid conflating two unrelated failure modes that happen to share a query ID.
 
@@ -142,16 +143,20 @@ Full-corpus sweep confirmed the scope before the fix shipped:
 
 **Why q005 isn't fixed now:** the same three candidate fixes remain on the table, none newly justified by this session's finding — a different reranker architecture (`bge-reranker-base`, untested), widening the guarantee to top-2-per-subquery when the margin is small, and (now ruled out for this specific row) the fragmentation fix. Consistent with this project's rigor-over-production-ceremony philosophy: documented as a real, understood, and now more precisely diagnosed limitation, rather than patched on a hunch.
 
+**8. Faithfulness judge over-penalizes trivial framing echoed from the query itself (new, July 22, 2026, single instance, not confirmed systematic).**
+
+q006's answer states "The parent technique is called Process Injection" — T1055's chunk fully supports the substantive claim word-for-word ("Adversaries may inject code into processes... execution is masked under a legitimate process"). The word "parent" is not an asserted fact about corpus taxonomy — it's an echo of the query's own phrasing ("What's the parent technique called..."). The judge scored this 1 ("largely fabricated"), which contradicts the rubric's own worked example: trivial connective/framing language that isn't load-bearing is explicitly scored 4, not 1. Distinct failure mode from Limitation #5 — not about refusals at all, about over-strict treatment of query-echoed framing as if it were a new claim. Single instance; whether this is stable miscalibration or one-off variance is unknown without repetition — same k=3 replication named under Limitation #5 would resolve both findings in one pass, not scheduled as two separate efforts.
+
 ---
 
 ## Deferred Work (not scheduled, not forgotten)
 
 - Fragmentation fix (Limitation #1) — **done, July 21, 2026.** Removed from this list; residual gaps (other 176 entries not individually checked, process-lifetime cache) noted under Limitation #1 above, not treated as open deferred work.
 - q005's guaranteed-slot-exhaustion + reranker-discrimination limitation (Limitation #7, q005 half) — still open, now more precisely diagnosed. Candidate fixes: `bge-reranker-base` trial, top-2-per-subquery guarantee when margin is small. Neither pursued without stronger evidence than one query.
-- Re-score faithfulness under the current architecture — retrieval was re-run and confirmed (0.9778 recall / 0.5333 precision) July 21; faithfulness was not.
+- Re-score faithfulness under the current architecture — **done, July 22, 2026.** Mean 4.0, 15/15 eligible (first full eligibility ever recorded). One row (q015) required a generation-side `MAX_TOKENS` fix first — see Faithfulness section above. Two new judge-calibration findings surfaced in the process (Limitations #5's new evidence, #8) — not resolved, carried forward below.
 - Correctness-vs-gold metric (separate from faithfulness), to resolve the judge's refusal-blindness (Limitation #5).
 - Root-cause q003's gated-arm tier instability (Limitation #6) — note this arm no longer exists post-rearchitecture; whether this finding still applies to the current pipeline is itself an open question.
-- Judge k=3 replication on boundary rows (q013, q015) to quantify variance directly.
+- Judge k=3 replication on boundary rows — originally q013, q015; **q006 and q009 added, July 22, 2026** (Limitations #5's new evidence and #8) — to quantify variance directly and determine whether either is noise or a stable miscalibration.
 - Eval-set growth past 20 queries — repeatedly named as the resolution to several small-n caveats, not yet scheduled.
 - Hybrid BM25 — deprioritized further this session: q008/q010's original vocabulary-mismatch framing turned out not to require it (q010's actual failure was header/crossref contamination, both fixed without lexical matching). Still an open question for any query where a genuine coverage gap (not ranking) is eventually confirmed.
 
