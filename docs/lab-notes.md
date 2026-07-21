@@ -331,7 +331,7 @@ T1140.txt is split across two separate chunks — confirmed by direct query, not
 
 **Effect.** A query needing the example specifically (q003) fails whenever only the definition chunk is retrieved, but recall@3 still reports success — recall is scored at the `technique_id` label level and can't see a technique's content is split across chunks.
 
-**Scope not established.** T1140 is the only technique confirmed so far, found while investigating one query's failure, not a systematic sweep. *(Superseded July 21 — see below and `eval_pipeline.md`, Known Limitation #1: a full-corpus sweep found 179/1823 entries, 9.8%, fragmented.)*
+**Scope not established.** T1140 is the only technique confirmed so far, found while investigating one query's failure, not a systematic sweep. *(Superseded July 21 — see below and `eval_pipeline.md`, Known Limitation #1: a full-corpus sweep found 179/1823 entries, 9.8%, fragmented; the fix itself shipped later the same day — see "Fragmentation Fix — Design, Implementation, and Verification," below.)*
 
 **Why not fixed now.** Requires an ingestion-time change or a recall-metric change; both larger than a same-day fix, out of scope for the boundary.
 
@@ -420,7 +420,7 @@ MITRE ATT&CK write-ups routinely cross-reference related techniques this way; th
 
 **Checked directly:** T1203's chunk contains no markdown cross-reference to T1190. Not the header or crossref pattern. T1203 ("Exploitation for Client Execution") and T1190 ("Exploit Public-Facing Application") are legitimately similar techniques — both fundamentally "exploit a vulnerability to execute code" — with a real but comparatively subtle distinguishing detail (client vs. public-facing server) for passage-relevance scoring specifically.
 
-**Decision: document, don't further engineer against, absent stronger evidence.** Two candidate fixes considered and explicitly declined: (1) `bge-reranker-base` — a genuinely different architecture/training-data test, not ruled out, just not pursued without more justification than one query; (2) widening the guarantee to top-2-per-subquery when the score margin is small — speculative, no confirmed mechanism to justify building it. Consistent with this project's rigor-over-production-ceremony philosophy. Full writeup: `eval_pipeline.md`, Known Limitation #7.
+**Decision: document, don't further engineer against, absent stronger evidence.** Two candidate fixes considered and explicitly declined: (1) `bge-reranker-base` — a genuinely different architecture/training-data test, not ruled out, just not pursued without more justification than one query; (2) widening the guarantee to top-2-per-subquery when the score margin is small — speculative, no confirmed mechanism to justify building it. Consistent with this project's rigor-over-production-ceremony philosophy. Full writeup: `eval_pipeline.md`, Known Limitation #7. *(Revisited and partially resolved later the same day — see Fragmentation Fix, below.)*
 
 ### Fix 2, refined — administrative vs. descriptive-title header fields
 
@@ -457,7 +457,7 @@ First run all session to beat the old pre-rearchitecture reference point on both
 
 **Text check, same rigor as every other diagnosis this session:** pulled T1111's actual chunk directly — no markdown cross-reference to T1621 or any other technique. Rewrite's sub-query text ("Bypass Multi-Factor Authentication") is neutral, containing neither T1621's nor T1111's canonical name — ruled out as a cause.
 
-**Discovered via this check: T1111 is fragmented (2 chunks)**, confirmed via a new tool built specifically to check this and a second hypothesis (cross-encoder token truncation) directly rather than inferring from possibly-stale pasted text. Truncation ruled out cleanly — both T1111 chunks (181 and 218 tokens combined with the query) are well under the model's 512-token limit. Fragmentation, not truncation, is the more likely contributing factor — though whether fixing it would close a 1.39-point gap remains untested.
+**Discovered via this check: T1111 is fragmented (2 chunks)**, confirmed via a new tool built specifically to check this and a second hypothesis (cross-encoder token truncation) directly rather than inferring from possibly-stale pasted text. Truncation ruled out cleanly — both T1111 chunks (181 and 218 tokens combined with the query) are well under the model's 512-token limit. Fragmentation, not truncation, is the more likely contributing factor — though whether fixing it would close a 1.39-point gap remains untested. *(Tested later the same day — see Fragmentation Fix, below: it does not close the gap, it widens it slightly.)*
 
 ### Full-corpus fragmentation sweep
 
@@ -473,6 +473,72 @@ First run all session to beat the old pre-rearchitecture reference point on both
 | Max fragmentation | T1034 — 7 chunks |
 
 **Directly checked, per the open question from Limitation #7's writeup:** `T1203` and `T1190` (q015's unresolved near-tie) are both fragmented, 3 chunks each. Whether a fragmentation fix helps, worsens, or doesn't move this specific near-tie is unknown — both sides of the comparison are equally affected, not confirmed to favor one direction.
+
+---
+
+## Fragmentation Fix — Design, Implementation, and Verification — July 21, 2026 (continued)
+
+### Context
+
+Full-corpus sweep re-confirmed the same day: 179/1823 (9.8%) fragmented, no drift since the earlier count. `T1621` (q005's competing candidate) checked specifically at this point and confirmed fragmented (3 chunks) — not previously known, materially changes the q005 diagnosis: the earlier "T1621 beat T1111" comparison was never a fair fight between complete descriptions, on *either* side.
+
+### Design decisions
+
+Two open questions from the sweep-writeup handoff, both decided before any code was written, per this project's no-guessed-interfaces discipline:
+
+1. **Scoring-level fix, not ingestion-level.** Ingestion-level (re-chunk source files, rebuild the collection) would shift dense search's own embeddings, not just reranking — full downstream re-verification of every fix this pipeline has shipped. Scoring-level is containable entirely inside `_guaranteed_slot_rerank_merge()`, same isolation contract as the header/crossref strips: changes what the scorer sees, never what's returned/cited/generated.
+2. **Targeted fetch, not fetch-everything, not pool-only.** Three options considered: (a) fetch every chunk for any technique_id appearing in a pool, always — correct, but pays a DB round-trip even for the 90.2% of technique_ids that are never fragmented, on every query, at generation time, not just in eval batches; (b) concatenate only whichever fragments already happened to surface in the pool — free, but not actually a fix, same chance-based completeness q003 already had; (c) **chosen:** compute the fragmented set live from collection metadata once per process (`_fragmented_ids()`, cached, no persisted file — avoids the drift risk a hand-maintained list would reintroduce), and only fire the extra fetch for technique_ids actually in that set. Full completeness where needed, zero added cost everywhere else.
+3. **Dedup key unchanged.** `technique_id` stays the dedup key. Fragment resolution (`_resolve_fragments()`) runs as a preprocessing step before both the guaranteed-slot rerank and the fill-step dedup — supplements the existing merge logic rather than replacing it.
+
+### Implementation
+
+`_fragmented_ids(db)` and `_resolve_fragments(db, candidates)` added to `retrieval_pipeline.py`. `_guaranteed_slot_rerank_merge()` signature gained a leading `db` parameter; its first two lines now resolve `dense_candidates` and every sub-query pool's candidates before any dedup/rerank logic runs. `retrieve_for_route()`'s call site updated to pass `db` through. Module docstring's stale fragmentation-scope note ("at least 5 techniques") corrected to the confirmed 179/1823.
+
+**Known accepted tradeoff, not a gap:** `_FRAGMENTED_IDS` is a module-level cache, computed once per process. A long-running process wouldn't notice newly-fragmented entries until restart — acceptable given this pipeline is re-invoked per eval run, not a long-lived server.
+
+### Smoke test
+
+`tests/smoke_test.py` — 6 tests, synthetic data, `rerank()` stubbed to a deterministic length-based score so assertions don't depend on real relevance. One test bug found and fixed before all 6 passed: `test_resolve_fragments_dedupes_repeated_technique_in_pool` initially asserted exactly 1 DB call for a repeated-technique-in-pool case, but didn't pre-warm `_fragmented_ids()`'s own cache first — the assertion was actually counting 2 calls (one to populate the cache, one to fetch the fragment set), not a code bug. Fixed by pre-warming the cache before capturing the call count, isolating the actual invariant under test. All 6 passing after the fix.
+
+### Diagnostic tooling update
+
+`inspect_candidate_pool.py` (recovered from local storage, not rebuilt from scratch) needed two changes before it was safe to run: (1) its call to `_guaranteed_slot_rerank_merge()` needed the new `db` parameter — would otherwise raise `TypeError` cleanly, not silently misbehave; (2) more materially, its "guaranteed slot preview" section reimplements the guarantee mechanism for visibility by reranking each sub-query's raw candidates directly — without also calling `_resolve_fragments()` first, this preview would show the pre-fix near-tie even once the fix was live, silently disagreeing with what production actually returns. Fixed to resolve fragments before the preview rerank, matching production exactly. Also added: known-fragmented-id flags on each raw pool listing, and `(resolved, N chunks merged)` annotations on any candidate that went through resolution — needed to actually see the fix acting during diagnosis, not just infer it from score deltas.
+
+### Targeted recheck
+
+Three queries confirmed touched by fragmentation: q003, q015, q005.
+
+**q003 — confirmed genuinely fixed, not lucky.** T1140 now resolves to both its chunks merged, scores 9.4927, and beats T1027 (also resolved, 3 chunks merged) by a 5.3-point margin (4.2064). Pre-fix, T1140's survival depended on which single chunk happened to win dedup; post-fix, it wins decisively on complete content.
+
+**q015 — confirmed fixed, fragmentation confirmed as the actual root cause.**
+
+| | Pre-fix (partial chunk) | Post-fix (full text) |
+|---|---|---|
+| T1190 | 2.1087 | 9.5639 |
+| T1203 | 2.6990 | 1.1060 |
+
+Pre-fix, T1203 was narrowly ahead. Post-fix, T1190 pulls 8.5 points clear. This resolves Known Limitation #7's q015 half: the near-tie really was a fragmentation artifact, not a genuine reranker-discrimination limit.
+
+**q005 — confirmed NOT fixed; root cause reclassified, not papered over.**
+
+| | Pre-fix (partial chunk) | Post-fix (full text) |
+|---|---|---|
+| T1621 | 8.7969 | 8.6667 |
+| T1111 | 7.4099 | 7.0174 |
+| Gap | 1.39 | 1.65 |
+
+Both techniques now score on complete, resolved text — the mechanism worked exactly as designed. The gap **widened**, not closed, confirming the risk flagged before this fix was written: T1621 being separately fragmented meant a naive fix could strengthen it as much as T1111. It did. This rules fragmentation out as q005's cause: with both descriptions complete, the reranker still legitimately prefers T1621 for this sub-query phrasing. The real cause remains Known Limitation #7's other two mechanisms — genuine reranker-discrimination difficulty between similar techniques, and guaranteed-slot budget exhaustion (q005's 3 sub-queries exactly fill `k=3`, so no fill step ever runs, leaving T1111 with zero path back regardless of score). Both still open, unaddressed by this fix, and not expected to be addressed by it — this was checked, not assumed.
+
+### Full-suite verification
+
+| | Baseline (pre-fragmentation-fix) | Post-fix | Δ |
+|---|---|---|---|
+| Recall | 0.9444 | **0.9778** | +0.0334 |
+| Precision | 0.5111 | **0.5333** | +0.0222 |
+
+Improves both axes simultaneously, same bar the rearchitecture itself cleared. Row-by-row: q015 0.50 → 1.00 (largest single contributor to the recall gain, consistent with the targeted recheck); q005 0.67 → 0.67, unchanged, consistent with fragmentation being ruled out as its cause; q003, q010, q013, q016 unchanged at 1.00, no regressions anywhere. Reconciliation check passed (recall sums match; scored + gated == total).
+
+**Go/no-go: GO.** The full-suite result matches the targeted recheck's predictions exactly — improved where fragmentation was diagnosed as the cause (q015), unchanged where it was diagnosed as not the cause (q005). That consistency between a pre-registered prediction and the full-suite outcome is itself evidence the diagnosis was correct, not just that the numbers moved in a favorable direction.
 
 ---
 
