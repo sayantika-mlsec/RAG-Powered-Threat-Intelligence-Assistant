@@ -584,4 +584,76 @@ q015 scored 2/5; the judge's own reason included "the answer is cut off mid-sent
 
 ---
 
+## Judge k=3 Replication — q006, q009 — July 22, 2026
+
+**Motivation.** Both findings surfaced in the same-day faithfulness re-score (Limitation #5's new evidence on q009, Limitation #8 on q006) were explicitly flagged "not confirmed systematic — single instance" and named in Deferred Work as needing k=3 replication before being treated as anything more than a possible one-off, per q013's own 1→5 precedent.
+
+**Method.** Three independent judge calls total per row (the original score + two replication rounds = k=3, consistent with this project's existing k=3 standard), each round seeding all 13 unrelated rows and forcing a fresh live judge call on only q006 and q009.
+
+**Results:**
+
+| Round | q006 score | q006 reason | q009 score | q009 reason |
+|---|---|---|---|---|
+| Original (baseline run) | 1 | "answer claims 'Process Injection' is a parent technique, but the context does not mention any parent-child relationships" | 1 | "answer claims insufficient information, but the context contains detailed information about multiple execution techniques" |
+| Round 1 | 1 | identical | 1 | identical |
+| Round 2 | 1 | identical | 1 | identical |
+
+**Conclusion: both confirmed stable, not noise.** 3/3 identical score and reasoning for both rows, in direct contrast to q013's documented 1→5 flip on an unchanged input. This is reproducible judge behavior, not sampling variance — updates `eval_pipeline.md` Known Limitations #5 and #8 from "single instance, not confirmed systematic" to confirmed.
+
+---
+
+## q009 — Manual Context Verification — July 22, 2026
+
+**Motivation.** k=3 replication confirmed q009's score is *stable*, but stability alone doesn't establish whether the score is *correct*. The judge's own stated reason ("the context contains detailed information about multiple execution techniques") is a different claim from the July 18 diagnosis ("legitimate refusal, eval-set defect") — worth resolving by inspecting the actual retrieved text, not by trusting either the judge's characterization or the earlier diagnosis on faith.
+
+**What was checked.** All three chunks retrieved for q009 in `generation_capture_post_frag.json` (T1047, T1203, T1651), searched directly for "Web-Based Enterprise Management" and "WBEM."
+
+**Finding.** Neither phrase appears in any of the three chunks. T1047's chunk fully describes WMI's abuse for execution — "administration feature," "infrastructure for management data and operations," "enables both local and remote access" — closely matching most of the query's phrasing, but the specific bridge the query asks for (that WMI is *built on Web-Based Enterprise Management standards*) is never stated. A true fact about WMI in the real world, absent from the corpus text.
+
+**Conclusion.** The July 18 diagnosis holds: the refusal was correct under the system's strict no-outside-knowledge grounding contract. The judge's reasoning checks topical relevance ("the context contains detailed information") rather than whether the *specific* claim asked about is supported — this is the judge's actual failure mode, now precisely identified rather than inferred.
+
+**Decision, recorded same day: q009 left as-is.** Not patching the judge prompt (would dilute faithfulness's narrow "grounding only" contract for one query) and not revising q009's eval-set phrasing (a legitimate test of corpus-completeness handling, not a flawed query). See `eval_pipeline.md` Known Limitation #5 for the consolidated statement.
+
+---
+
+## Correctness-vs-Gold Metric — Design and Build — July 22, 2026
+
+**Build a separate correctness metric, do not patch the faithfulness judge.** Faithfulness's entire value is its narrow, honest contract ("grounding only, not correctness" — stated explicitly in `JUDGE_SYSTEM_INSTRUCTION`). Teaching it to also recognize "this refusal was epistemically warranted" is a correctness judgment wearing a faithfulness costume — it would work for q009 and then fail differently on the next boundary case, requiring another patch. A separate correctness-vs-gold metric keeps both signals honest and independently checkable, and the gold answers (`expected_answer_summary`) already exist to build it against.
+
+**Structure.** `correctness_score.py` reuses `faithfulness_score.py`'s skeleton (resumable scratch file, atomic tempfile+`os.replace` writes, reconciliation invariant, MLflow lineage logging).
+
+**Deliberate divergence from the reused skeleton: no eligibility gate.** Faithfulness excludes rows with recall@3 = 0 because grounding is undefined without context. Correctness scores all 15 Group A rows unconditionally — a refusal caused by bad retrieval is exactly the case this metric needs to capture, not exclude. N is fixed at 15 every run, not variable, and this is logged explicitly via an MLflow tag (`gate: none_scores_all_group_a`) rather than left implicit.
+
+**Judge contract.** Compares candidate answer against `expected_answer_summary` and the original question only — never sees retrieved context, keeping the two judges' inputs strictly separate. Rubric mirrors faithfulness's 1–5 shape and JSON output contract for consistency, but scores outcome correctness rather than grounding. Refusal handling is not special-cased in code: the rubric's own bottom band ("no correct information delivered... or is a refusal/non-answer providing none of GOLD's content") naturally scores a refusal low, so q006/q009-shaped rows fall out of ordinary judging.
+
+---
+
+## First Correctness Run — Results and Cross-Metric Findings — July 22, 2026
+
+**Result:** correctness mean = **3.533**, N = 15/15. First-ever run of this metric — this number is the baseline, nothing to diff against.
+
+**Per-row read, faithfulness vs. correctness (full table logged to `correctness/per_row.json` in MLflow; summarized here):**
+
+| id | Faithfulness | Correctness |
+|---|---|---|
+| q001, q002, q007, q013 | 5, 5, 5, 5 | 5, 5, 5, 5 |
+| q003, q004 | 5, 5 | 3, 3 |
+| q005 | 5 | 3 (wrong technique ID: T1621 named instead of T1111 — consistent with Limitation #7's still-open q005 finding) |
+| q006 | 1 | 3 |
+| q008 | 3 | 5 |
+| q009 | 1 | 1 |
+| q010 | 5 | 3 |
+| q011, q012 | 4, 4 | 3, 3 |
+| q015, q016 | 4, 3 | 3, 3 |
+
+**q006 — independent cross-metric corroboration.** A different judge, different rubric, same answer: correctness explicitly credits "correctly identifies the parent technique as Process Injection," docking only missing supporting detail — not fabrication. Two independent judges converge on "the answer is substantively right." Strengthens Limitation #8's conclusion beyond the k=3 replication alone: not just reproducible, but corroborated by an orthogonal metric.
+
+**q009 — agreement for different, non-conflicting reasons.** Correctness's 1 is definitionally correct (a refusal conveys none of gold's facts) and needs no caveat. Faithfulness's 1 remains the miscalibrated one, per the manual context verification above. The two metrics landing on the same number doesn't mean they agree on *why* — this is the intended behavior of keeping them orthogonal, not a coincidence to explain away.
+
+**New finding: KEV corpus text never states "actively exploited," confirmed corpus-wide.** Checked directly: all 10 retrieved KEV chunks across q011, q012, q013, q015, q016 — the literal phrase "actively exploited" appears in none of them. Exploitation status is implicit in KEV catalog membership but never asserted as chunk text. Every query phrasing that explicitly asks the model to confirm exploitation status produces an honest hedge: confirmed on q011, q012, q015, q016. q013 avoids it only because its phrasing doesn't force an explicit assertion. Faithfulness does not catch this (the hedge is honestly grounded — scores 4 on q011/q012). Correctness does (gold assumes KEV membership implies confirmed exploitation — scores 3 on all four rows). Filed as new `eval_pipeline.md` Known Limitation #9 — the first confirmed case of the two-metric framework surfacing a real gap that neither metric alone would show. Root cause is corpus-completeness, not a judge miscalibration on either side; not fixed this session, two candidate resolutions named and deferred (corpus enrichment vs. accepting the model's hedge as correct and revising gold's assumption — same resolution class as q009).
+
+**New flag, unconfirmed: q010, possible correctness-judge over-penalization.** q010's gold deliberately withholds the technique name by eval-set design (tests definition-matching without keyword hints). The candidate correctly named T1105 anyway; correctness docked it to a 3 for doing so. Possible mirror image of Limitation #8 — a judge penalizing a superset of correct information relative to a deliberately terse comparison target, but in the correctness judge rather than faithfulness. Single instance, not replicated — filed as `eval_pipeline.md` Known Limitation #10, explicitly flagged open rather than resolved. k=3 replication (same protocol as q006/q009) would settle it.
+
+---
+
 *End of chronological record as of July 22, 2026.*
